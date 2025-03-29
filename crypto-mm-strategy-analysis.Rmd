@@ -1,0 +1,2544 @@
+---
+title: "Investigating Trading Behaviour, Profit and Loss, and Market Impact of a Cryptocurrency Trading Strategy"
+author: "Alan Matthew"
+date: "2025-03-15"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Executive Summary
+
+## Background and Motivation
+
+In this project, I will analyze high-speed trading data (`fills_data`) and market data (`market_data`) from a cryptocurrency trading strategy to better understand its behavior and uncover the factors driving profit and loss (PnL). Additionally, I will investigate whether the strategy has any measurable impact on market prices, as this is crucial for assessing both its risk of influencing the market unfairly and its long-term sustainability in competitive environments.
+
+In this regard, I will investigate the strategy from three angles:
+
+1. Trading Behavior: Can we tell whether a trade will be a buy or a sell? Understanding this helps shed light on what drives the strategy's decision-making. 
+
+2. Profit and Loss (PnL): What are the key factors that influence whether the strategy makes or loses money? This is important because consistent profitability is the core goal of any trading strategy, yet understanding what truly drives PnL remains a challenging and unresolved problem in the industry.
+
+3. Market Impact: Do the trades made by this strategy cause measurable movements in market prices? This is essential for understanding whether the strategy could inadvertently influence prices, which may not only undermine its profitability but also pose broader risks to market stability and fairness.
+
+This study contributes to an ongoing industry conversation about how to best evaluate and model trading strategies. Despite widespread interest, there is still no universally accepted approach to answering these questions as different firms and researchers often rely on their own heuristics or ad hoc methods.
+
+As a student entering the crypto trading industry, I was inspired by my internship experience where I saw firsthand how difficult these problems are in practice. My call to action is to develop my own methodology to address these questions in a rigorous, data-driven way. I hope that the results of this study will lead to useful insights and practical tools that can be applied in real-world trading environments.
+
+## Key Findings
+
+1. **Predicting Profit and Loss (PnL)**  
+We tested several models to see if we could accurately predict when the trading strategy would make or lose money. These included a few advanced machine learning methods like Gradient Boosted Machines (GBM), Convolutional Neural Networks (CNN), and H2O’s AutoML platform, as well as a simple multiple linear regression. The GBM model gave the best results, predicting profit and loss with around 12% average error. However, even the best model struggled to be consistently reliable, showing that predicting profits in high-speed crypto markets is still a tough problem. This highlights the need for better features and possibly new types of models to improve performance.
+
+2. **Understanding Trade Direction (Buy or Sell)**  
+We were able to perfectly predict whether the next trade would be a buy or sell using a simple logistic regression model, driven entirely by one key input: how far the strategy's current position is from its recent average. This aligns with the idea that market makers aim to stay balanced and manage risk. However, relying on a single variable (`deviation_from_mean_balance_diff`) makes interpretation difficult — does the strategy really ignore all other market signals? To gain deeper insight, future work should incorporate additional features like short-term price volatility, order book depth, or recent trade flow. This would help build more accurate and interpretable models that better reflect the true decision-making process.
+
+3. **Do the Trades Move the Market? (Market Impact)**  
+To test whether our trading strategy affects prices, we created a custom metric: the one-minute price change after each trade (or “fill”). Using permutation testing, we found no consistent evidence that either Maker trades (which provide liquidity) or Taker trades (which consume it) moved the market. This result supports the **Efficient Market Hypothesis (EMH)**, which suggests that asset prices already reflect all available information, so individual trades shouldn’t cause predictable price changes. Our findings align with this theory and suggest that our metric could be useful for evaluating market impact in future studies.  
+*Note: Providing liquidity (Maker) means placing limit orders that wait to be filled, helping others trade. Taking liquidity (Taker) means placing market orders that are filled immediately, removing available offers from the order book.*
+
+## Contribution to the Existing Discussion
+
+Our study helps confirm two important ideas that professionals in the trading industry often debate:
+
+1. Even though machine learning tools are powerful, they're not magic — predicting profit and loss in a fast-moving, competitive environment like crypto still requires deep understanding of the market and careful design of the inputs (features) used in the models.
+
+2. Some critics worry that automated trading might unfairly influence prices. But our results suggest the opposite: this kind of trading doesn't create major price shifts and may actually help the market by making it more efficient and stable.
+
+## Call to Action
+
+For anyone working to improve trading strategies, especially market making, the key takeaway is to focus on the quality of data rather than relying solely on increasingly complex machine learning models. Incorporating richer, real time information such as order submission timestamps, order book depth, or macroeconomic indicators like interest rates can lead to better predictions of profit and trading behavior. In many cases, thoughtful **feature engineering** by designing meaningful inputs for models is more effective than using extremely technical models with limited interpretability.
+
+## Limitations and Future Directions
+
+1. Limited Data: We only analyzed trades from one strategy on one exchange, which limits our understanding of how broader market conditions — such as global events, macroeconomic indicators, or the actions of other market participants — influence performance. Having access to more diverse data and incorporating these external features could improve model accuracy and help uncover deeper insights into what drives profit and loss.
+
+2. Model Performance: While GBM performed best in this project, other models like CNN and AutoML underperformed. Although we emphasized the importance of feature engineering over model complexity, once richer and more informative features are available, it may be worthwhile to experiment with a wider range of models — including architectures like LSTMs that capture time-based patterns — to identify which approaches deliver the most robust results.
+
+3. Deeper Look at Market Impact: A more detailed analysis — such as checking how trades ripple through multiple exchanges — could give a clearer picture of whether this strategy influences the wider market.
+
+In summary, this project showed that while it's possible to understand some parts of a market-making strategy, like predicting trade direction, other parts, like forecasting profits, remain much harder. Importantly, our findings suggest that this strategy helps markets function smoothly, rather than disrupt them. For professionals and researchers, the main takeaway is to focus on the quality of your data and thoughtful feature engineering rather than spending excessive effort on tuning or using highly advanced machine learning models. Only once strong, informative features are in place is it worthwhile to experiment with more complex models to see if they offer meaningful improvements.
+
+# Exploratory Data Analysis 
+
+I will begin my investigation by loading the dataset and inspecting it for missing values and outliers. Then, I will lay the groundwork and compute two important features for our subsequent modelling and analysis: mid price and PnL.
+
+```{r, message=TRUE}
+library(tidyverse)  
+library(lubridate)  
+library(arrow)      
+library(data.table) 
+library(caret)      
+library(pROC)       
+library(h2o)        
+library(magrittr)   
+library(tinytex)    
+library(readxl)     
+library(resampledata) 
+library(car)          
+library(corrplot)     
+library(gridExtra)    
+library(zoo)          
+library(rpart)        
+library(rpart.plot)   
+library(tseries)      
+library(forecast)     
+library(lmtest)    
+library(strucchange)
+library(trend)
+library(sandwich)
+library(TSA)
+library(Metrics)
+library(gbm)
+library(glmnet)
+
+set.seed(123)
+```
+
+## Data Inspection
+
+```{r}
+market_data <- read_parquet("data/market_data.parq")
+fills_data <- read_parquet("data/fills_data.parq")
+
+head(fills_data, 5)
+head(market_data, 5)
+```
+
+From the preview above, we can see the structure of each dataset. There are some features in `fills_data` and `market_data` that we need to convert to factors.
+
+```{r}
+fills_data <- fills_data %>%
+  mutate(
+    side = as.factor(side),
+    liquidity = as.factor(liquidity),
+    symbol = as.factor(symbol),
+    exch = as.factor(exch),
+    fee_ccy = as.factor(fee_ccy)
+  )
+
+market_data <- market_data %>% 
+  mutate(
+    symbol = as.factor(symbol)
+  )
+```
+
+Next, let us check each dataset's structure and dimensions.
+
+```{r}
+cat("--- Summary of fills_data ---\n")
+cat("Dimensions: ", paste(dim(fills_data), collapse = " x "), "\n\n")
+str(fills_data)
+summary(fills_data)
+
+cat("\n--- Summary of market_data ---\n")
+cat("Dimensions: ", paste(dim(market_data), collapse = " x "), "\n\n")
+str(market_data)
+summary(market_data)
+```
+
+The `fills_data` dataset has `1123` rows and `13` columns. The key fields include `timestamp` which shows the date-time of the trade, `order_id` which identifies each trade, `side` which shows whether a trade is "B" for buy or "S" for sell, `fill_prc` which shows what price the trade was fulfilled, `fill_qty` which shows the quantity traded, `fee` which shows the fees paid for the trade, `balance` which shows the inventory balance after the trade (in the asset or quote currency), and other fields like `symbol`, `exch`, etc., as indicated by the structure output.
+
+The `market_data` dataset has `1208954` rows (covering the same time span with higher frequency) and 4 columns. They are `timestamp`, which is the date-time of the market snapshot, `bid_prc` which is the best bid price at that time, `ask_pr` which is the best ask price at that time, and `symbol` which is only `ETHUSDT`. For context, the bid price is the price at which people are willing to buy the asset on the market, and ask price is the price at which people are willing to sell the asset on the market. In trading, there can be many bid and ask prices, but there can be only one best bid and best ask price. The best bid price is the highest price someone is willing to purchase the asset, and the best asking price is the lowest price someone is willing to sell the asset. We assume that the `bid_prc` and `ask_prc` are the best bid and best ask prices. 
+
+```{r}
+cat("total NAs in fills_data: ", sum(is.na(fills_data)), "\n")
+cat("total NAs in market_data: ", sum(is.na(market_data)))
+```
+
+Both datasets show 0 missing values, indicating they are complete and do not require imputation or removal of NA rows. This simplifies our data cleaning. 
+
+Next, we need to join the `fills_data` and `market_data` datasets so we can use them for analysis.
+
+```{r}
+setDT(fills_data)
+setDT(market_data)
+setkey(fills_data, timestamp)
+setkey(market_data, timestamp)
+
+merged_data <- market_data[fills_data, roll = Inf] # selects the most recent (previous) value
+
+merged_data <- subset(merged_data, select = -c(i.symbol))
+
+head(merged_data, 5)
+cat("--- Summary of merged_data ---\n")
+cat("Dimensions: ", paste(dim(merged_data), collapse = " x "), "\n")
+cat("Column Names:\n")
+colnames(merged_data)
+cat("total NAs in merged_data: ", sum(is.na(merged_data)))
+```
+
+After merging, `merged_data` has the same number of rows as `fills_data`. I dropped the duplicate symbol column (`i.symbol`) resulting from the join. Furthermore, there are no NA values.
+
+## Calculating Profit and Loss 
+
+To calculate PnL, I must first calculate mid price. Mid price is defined as the average between the bid and ask prices. It is often considered as a good measure of an asset's market value. If the bid price is the price at which people are willing to buy the asset, and the ask price is the price at which people are willing to sell the asset, then intuitively the true market price should be somewhere in the middle, i.e the average.
+
+```{r}
+merged_data <- merged_data %>% mutate(
+  mid_price = (bid_prc + ask_prc) / 2
+)
+```
+
+Once we have the mid price, which is a measure of the market price of the asset, we can compute profit and loss. Here, profit and loss of a single trade is defined by the following formula: 
+
+$$
+\text{Trade PnL} = q_i m - q_i p_i
+$$
+
+In this formula, $q_i$ is the size of the trade at timestamp $i$, $p_i$ is the price at which the trade was filled, and $m$ is the market price, or mid price, of the asset. If we are buying, then the sign of $q_i$ is positive, and if we are selling, the sign of $q_i$ is negative. 
+
+```{r}
+calculate_trade_pnl <- function(merged_data) {
+  merged_data <- merged_data %>% mutate(
+    q_i = if_else(side == "B", fill_qty, -fill_qty),
+  ) %>% mutate(
+    trade_pnl = (q_i * mid_price) - (q_i * fill_prc)
+  )
+  return(merged_data)
+}
+
+merged_data <- calculate_trade_pnl(merged_data)
+```
+
+By calculating trade PnL, we can compute cumulative PnL, which we can use the measure how well the strategy does over time. It is computed by finding the cumulative sum of trade PnL.
+
+$$
+\text{Cumulative PnL} = \sum q_i m - \sum q_i p_i
+$$
+
+```{r}
+merged_data <- merged_data %>% 
+  mutate(
+    cumulative_pnl = cumsum(trade_pnl)
+  )
+```
+
+```{r}
+cat("Total Cumulative PnL: ", tail(merged_data$cumulative_pnl, 1))
+cat("\n")
+cat("Duration of Trading: ", tail(merged_data$timestamp, 1) - head(merged_data$timestamp, 1))
+```
+
+The strategy ran for 14.76 days and earned a total of 33.67 USD.
+
+```{r}
+ggplot(merged_data, aes(x = timestamp, y = cumulative_pnl)) + 
+  geom_line(color = "blue") + 
+  geom_point(color = "red") + 
+  labs(title = "Cumulative PnL Over Time",
+       x = "Timestamp",
+       y = "Cumulative PnL (US$)") +
+  theme_minimal()
+```
+
+# Modelling Buying and Selling
+
+I will begin by addressing my first research question, which aims to uncover the trading strategy's behavior and identify the key factors that drive its decision-making. To achieve this, I will model the strategy's buying and selling behavior and analyze the resulting model's features and coefficients to gain insight into its actions.
+
+## Data Preperation
+
+I begin by engineering features that may help us with our modelling.
+
+```{r}
+classification.data <- merged_data
+colnames(classification.data)
+```
+
+First, I will apply one-hot encoding to the categorical variables `side` and `liquidity`. 
+
+```{r}
+library(fastDummies)
+# encode the dataset to model what factors are more likely to influence buying
+classification.data$side <- ifelse(classification.data$side == "B", 1, 0)
+classification.data$side <- as.factor(classification.data$side)
+
+classification.data <- dummy_cols(classification.data,
+                                  select_columns = c("liquidity"),
+                                  remove_first_dummy = TRUE,
+                                  remove_selected_columns = TRUE)
+table(classification.data$side)  # Buy = 1, Sell = 0, verified correct
+table(classification.data$liquidity_Taker)
+```
+```{r}
+# volatility calculations
+volatility_data <- market_data %>%
+  mutate(mid_price = (bid_prc + ask_prc) / 2) %>%
+  arrange(timestamp) %>%
+  mutate(volatility = rollapply(mid_price, width = 20, FUN = sd, fill = NA, align = "right"))
+
+setDT(classification.data)
+setDT(volatility_data)
+setkey(classification.data, timestamp)
+setkey(volatility_data, timestamp)
+
+classification.data <- volatility_data[, .(timestamp, volatility)][classification.data, roll = Inf]
+
+classification.data <- classification.data %>%
+  arrange(timestamp) %>%
+  mutate(
+    balance_lag1 = lag(balance),
+    spread_lag1 = lag(ask_prc - bid_prc),
+    mid_price_lag1 = lag((bid_prc + ask_prc) / 2),
+    volatility_lag1 = lag(volatility)
+  )
+
+# Fill Size (no lag, trade-specific)
+classification.data <- classification.data %>%
+  mutate(
+    fill_size = fill_qty * fill_prc # do not encode buy/sell sign
+  )
+
+# Deviation from Mean Inventory Balance (lagged)
+mean_inventory_balance <- mean(classification.data$balance, na.rm = TRUE)
+
+classification.data <- classification.data %>%
+  mutate(
+    deviation_from_mean_balance_lag1 = balance_lag1 - mean_inventory_balance,
+    deviation_from_mean_balance_diff_lag = c(NA, diff(deviation_from_mean_balance_lag1))
+  )
+
+# Deviation from Mean Market Price (lagged)
+mean_mid_price <- mean(classification.data$mid_price, na.rm = TRUE)
+
+classification.data <- classification.data %>%
+  mutate(
+    deviation_from_mean_mid_price_lag1 = mid_price_lag1 - mean_mid_price,
+    deviation_from_mean_mid_price_diff = c(NA, diff(deviation_from_mean_mid_price_lag1))
+  )
+
+# Lagged Trade PnL and Cumulative PnL
+classification.data <- classification.data %>%
+  mutate(
+    trade_pnl_lag1 = lag(trade_pnl),
+    cumulative_pnl_lag1 = lag(cumulative_pnl)
+  )
+
+classification.data <- na.omit(classification.data)  # Remove resulting NAs
+str(classification.data)
+```
+
+```{r}
+num_features <- c("volatility_lag1",
+                  "spread_lag1",
+                  "fill_prc",
+                  "fill_qty",
+                  "trade_pnl_lag1",
+                  "cumulative_pnl_lag1",
+                  "fee", "balance_lag1",
+                  "mid_price_lag1", "fill_size",
+                  "deviation_from_mean_balance_diff_lag",
+                  "deviation_from_mean_mid_price_lag1")
+
+non_num_features <- c("side", "liquidity_Taker")
+
+classification.features <- cbind(num_features, non_num_features)
+```
+
+The selected features capture key aspects of market conditions, inventory dynamics, and trade characteristics, while ensuring the model only uses information available before each trade through appropriate lagging. Lagged variables like `trade_pnl_lag1`, `cumulative_pnl_lag1`, `balance_lag1`, and `mid_price_lag1` allow the model to realistically incorporate past performance and market state without forward-looking bias. Additionally, `spread_lag1` is used instead of `bid_prc` and `ask_prc` to avoid multicollinearity while still capturing relevant information about market tightness. Furthermore, differenced features capture short-term changes in inventory and price deviations which are potentially informative for modeling trade decisions. The variables `fill_prc`, `fill_qty`, and `fill_size` do not require lagging as they are known immediately at trade execution, with `fill_size` representing the dollar value of the trade (price times quantity), providing direct information about trade magnitude.
+
+Next, I will remove outliers using the IQR method to help mitigate the influence of extreme values, which could otherwise distort the model's understanding of typical trading behavior.
+
+```{r}
+Q1 <- quantile(classification.data$trade_pnl, 0.25)
+Q3 <- quantile(classification.data$trade_pnl, 0.75)
+IQR_value <- Q3 - Q1
+
+lower_bound <- Q1 - 1.5 * IQR_value
+upper_bound <- Q3 + 1.5 * IQR_value
+
+original_count <- nrow(classification.data)
+
+outliers <- which(classification.data$trade_pnl < lower_bound | classification.data$trade_pnl > upper_bound)
+
+num_outliers <- length(outliers)
+
+cat("Number of outliers removed:", num_outliers, "\n")
+
+classification.data <- classification.data %>%
+  filter(trade_pnl >= lower_bound & trade_pnl <= upper_bound)
+
+cat("Remaining observations after outlier removal:", nrow(classification.data), "\n")
+```
+
+Subsequently, I will scale the  numerical features ensures that variables are measured on a consistent scale, preventing variables with larger magnitudes from dominating the model.
+
+```{r}
+scaled_numeric <- as.data.frame(scale(classification.data[, ..num_features]))
+
+categorical_data <- classification.data %>%
+  select(side, liquidity_Taker)
+
+scaled_data <- cbind(scaled_numeric, categorical_data)
+
+colnames(scaled_data)
+str(scaled_data)
+```
+
+Finally, I will split the dataset into training and testing sets to assess how well the model generalizes to unseen data, which is crucial for evaluating its real-world predictive performance.
+
+```{r}
+trainIndex <- createDataPartition(scaled_data$side, p = 0.8
+                                  , list = FALSE)
+
+train_data <- scaled_data[trainIndex, ]
+test_data  <- scaled_data[-trainIndex, ]
+
+cat("Training Set Size:", nrow(train_data), "\n")
+cat("Testing Set Size:", nrow(test_data), "\n")
+```
+
+## Logistical Regression
+
+My first attempt will involve fitting a logistic regression model. I will begin by manually removing features that clearly overlap to improve model interpretability, and then apply L1 regularization (LASSO) to automatically filter out less impactful predictors and retain only the most informative features.
+
+### Feature Selection
+
+```{r}
+classification.features <- setdiff(classification.features, "side")  # exclude target from predictors
+classification.features
+```
+The features `mid_price_lag1` and `deviation_from_mean_mid_price_lag1` both encode information about the mid-price, while `balance_lag1` and `deviation_from_mean_balance_diff_lag` both capture inventory imbalance dynamics. Including both in the model could introduce redundancy and multicollinearity, so I will remove `mid_price_lag1` and `balance_lag1` to retain only the more informative differenced features.
+
+```{r}
+classification.features <- setdiff(classification.features, c("mid_price_lag1", "balance_lag1"))
+classification.features
+```
+Now, I will apply L1 regularization (LASSO) to automatically filter out less impactful predictors and retain only the most informative features.
+
+```{r}
+num_logistic_features <- setdiff(classification.features, non_num_features)
+
+x_logistic <- as.matrix(scaled_data[, num_logistic_features])
+
+y_logistic <- scaled_data$side
+
+lasso_logistic <- cv.glmnet(
+  x = x_logistic,
+  y = y_logistic,
+  family = "binomial",
+  alpha = 1,
+  nfolds = 10
+)
+
+plot(lasso_logistic)
+
+best_lambda_logistic <- lasso_logistic$lambda.min
+cat("Optimal Lambda:", best_lambda_logistic, "\n")
+
+lasso_coef <- coef(lasso_logistic, s = best_lambda_logistic)
+selected_logistic_features <- rownames(lasso_coef)[which(lasso_coef != 0)]
+selected_logistic_features <- setdiff(selected_logistic_features, "(Intercept)")
+
+cat("Selected Features by LASSO:\n")
+selected_logistic_features
+
+lasso_df <- data.frame(
+  Feature = rownames(lasso_coef),
+  Coefficient = as.numeric(lasso_coef)
+) %>%
+  filter(Feature != "(Intercept)" & Coefficient != 0) %>%
+  arrange(abs(Coefficient))
+
+ggplot(lasso_df, aes(x = reorder(Feature, Coefficient), y = Coefficient)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "LASSO Logistic Regression Feature Importance",
+       x = "Feature", y = "Coefficient") +
+  theme_minimal()
+
+final_logistic_features <- c(selected_logistic_features, "liquidity_Taker")
+final_logistic_features
+```
+
+The LASSO regression selects `deviation_from_mean_balance_diff_lag` as the most influential predictor, suggesting that recent changes in inventory imbalance are the strongest driver of trade direction, while `fill_size` also plays a moderate but significant role, indicating that larger trades slightly decrease the odds of buying.
+
+### Modelling
+
+```{r}
+formula_str <- paste("side ~",
+                     paste(final_logistic_features,
+                           collapse = " + "))
+logit_model <- glm(
+  formula_str, 
+  data = scaled_data,
+  family = binomial(link = "logit")
+)
+
+logistic_pred_data <- scaled_data
+logistic_pred_data$logit <- predict(logit_model,
+                                    newdata = logistic_pred_data,
+                                    type = "link")
+```
+
+```{r}
+for (feature in final_logistic_features) {
+  p <- ggplot(logistic_pred_data, aes_string(x = feature, y = "logit")) +
+    geom_point(alpha = 0.3) +
+    geom_smooth(method = "glm", span = 0.75, se = FALSE, color = "blue") +
+    labs(title = paste("Logit vs", feature),
+         y = "Logit (log-odds of Buy)", x = feature) +
+    theme_minimal()
+  print(p)
+}
+```
+
+The scatterplots reveal that `deviation_from_mean_balance_diff_lag` is the strongest predictor, showing a clear positive relationship with the log-odds of executing a buy trade. `fill_size` also serves as a useful indicator, with larger trades being slightly associated with sell decisions. In contrast, `volatility_lag1`, `spread_lag1`, and `liquidity_Taker` exhibit only weak relationships with the logit, suggesting limited predictive power.
+
+```{r}
+ctrl <- trainControl(
+  method = "cv",
+  number = 10,
+  summaryFunction = defaultSummary,
+  classProbs = FALSE
+)
+
+logit_model <- train(
+  side ~ volatility_lag1 + spread_lag1 + fill_size + deviation_from_mean_balance_diff_lag + liquidity_Taker,
+  data = train_data,
+  method = "glm",
+  family = binomial,
+  metric = "Accuracy",
+  trControl = ctrl
+)
+
+logit_model
+```
+
+The logistic regression model achieved an accuracy of approximately 60%, which, while better than random guessing, leaves room for improvement. I will try re-modelling using the optimum threshold.
+
+### Evaluation
+
+```{r}
+library(pROC)
+logit_test_data <- test_data
+logit_test_probs <- predict(logit_model, newdata = logit_test_data, type = "prob")[,2]  # Probability of Buy = 1
+
+roc_logit <- roc(
+  response = logit_test_data$side,
+  predictor = logit_test_probs
+)
+
+plot(roc_logit, main = "ROC Curve - Logistic Regression")
+
+opt_coords_logit <- coords(
+  roc_logit,
+  x = "best",
+  ret = c("threshold", "sensitivity", "specificity", "accuracy"),
+  transpose = FALSE
+)
+opt_coords_logit
+
+optimal_threshold_logit <- opt_coords_logit$threshold
+
+logit_test_preds_opt <- ifelse(logit_test_probs > optimal_threshold_logit, 1, 0)
+logit_test_preds_opt <- factor(logit_test_preds_opt, levels = levels(logit_test_data$side))
+
+cm_logit <- confusionMatrix(logit_test_preds_opt, logit_test_data$side)
+cm_logit
+```
+
+The logistic regression model achieves a balanced accuracy of approximately 69.67%, confirming that inventory imbalance (`deviation_from_mean_balance_diff_lag`) and trade size (`fill_size`) are key determinants of the strategy's decision to buy, highlighting a momentum-like behavior where larger inventory deviations drive further accumulation.
+
+## Ridge Regression
+
+To improve predictive performance, I will apply Ridge regression, which is known to reduce the risk of overly large coefficients when one or more features dominate the decision boundary.
+
+### Feature Selection
+
+Since Ridge is a regularized extension of logistic regression, I will retain the same set of features selected previously.
+
+### Modelling
+
+```{r}
+# training
+x_train <- model.matrix(~ volatility_lag1 + spread_lag1 + fill_size
+                        + deviation_from_mean_balance_diff_lag
+                        + liquidity_Taker, data = train_data)
+y_train <- as.numeric(as.character(train_data$side))
+
+# testing
+x_test  <- model.matrix(~ volatility_lag1 + spread_lag1 + fill_size
+                        + deviation_from_mean_balance_diff_lag
+                        + liquidity_Taker, data = test_data)
+y_test  <- as.numeric(as.character(test_data$side))
+
+cv.ridge <- cv.glmnet(
+  x = x_train,
+  y = y_train,
+  alpha = 0,
+  family = "binomial",
+  nfolds = 10
+)
+
+best_lambda <- cv.ridge$lambda.min
+cat("Best lambda via CV:", best_lambda, "\n")
+
+coef(cv.ridge, s = "lambda.min")
+```
+
+Compared to the logistic regression model, the Ridge regression shrunk the coefficients towards zero while preserving their signs, with `deviation_from_mean_balance_diff_lag` remaining the dominant positive predictor of buy trades. Other features like `fill_size` and `liquidity_Taker` still show moderate negative influence, while `volatility_lag1` and `spread_lag1` retain small positive contributions, indicating that Ridge stabilizes but does not drastically alter the model's interpretation.
+
+Next, I will apply the model against the testing set which contains unseen data.
+
+```{r}
+x_test <- model.matrix(~ volatility_lag1 + spread_lag1 + fill_size
+                       + deviation_from_mean_balance_diff_lag
+                       + liquidity_Taker, data = test_data)
+pred_probs <- predict(cv.ridge, newx = x_test, s = best_lambda, type = "response")
+```
+
+Using these results, I want to find the optimum probability cutoff.
+
+```{r}
+library(pROC)
+
+roc_ridge <- roc(
+  response = test_data$side,
+  predictor = as.numeric(pred_probs) # Ridge predicted probabilities
+)
+
+plot(roc_ridge, main = "ROC Curve - Ridge Regression")
+
+opt_coords_ridge <- coords(
+  roc_ridge,
+  x = "best",
+  ret = c("threshold", "sensitivity", "specificity", "accuracy"),
+  transpose = FALSE
+)
+
+opt_coords_ridge
+```
+
+### Evaluation
+
+```{r}
+optimal_threshold_ridge <- opt_coords_ridge$threshold
+
+# if prob of side = 1 < threshold -> side = 0 (Sell)
+ridge_pred_class <- ifelse(pred_probs < optimal_threshold_ridge, 0, 1)
+ridge_pred_class <- as.factor(ridge_pred_class)
+test_actual_ridge <- as.factor(test_data$side)
+
+
+# confusion Matrix (with '0' as the positive class)
+cm_ridge <- confusionMatrix(ridge_pred_class, test_actual_ridge, positive = "0")
+cm_ridge
+```
+
+The logistic regression model achieved an accuracy of approximately 69.67%, outperforming random guessing at around 51.7%, indicating that the model captures useful patterns. This model's interpretation is similar to the logistic model's interpretation. Overall, this model reveals that the strategy exhibits a form of momentum, where prior inventory accumulation is a key driver of subsequent buy decisions. For future work, incorporating more data and engineering additional relevant features could further enhance the model's predictive power by capturing more subtle patterns and dynamics influencing buy decisions.
+
+## Gradient Boosting
+
+To explore whether a non-linear model could improve performance, I will next fit a Gradient Boosting Machine (GBM) model.
+
+### Feature Selection
+
+Since GBM can capture non-linear interactions and does not rely on strong parametric assumptions like logistic regression, I used Recursive Feature Elimination (RFE) to select the most informative subset of features based on predictive performance.
+
+Here, I first tuned the hyperparameters using cross-validation with the ROC AUC as the objective, as maximizing the area under the ROC curve is well-suited for imbalanced classification problems and provides a robust measure of the model's ability to distinguish between buy and sell trades.
+
+```{r}
+gbm_features <- setdiff(colnames(train_data), "side")
+
+# grid search the best hyperparameters
+gbm_grid <- expand.grid(
+  n.trees = seq(100, 1000, by=100),
+  interaction.depth = c(1, 3, 5),
+  shrinkage = c(0.01, 0.05, 0.1),
+  n.minobsinnode = c(5, 10)
+)
+
+gbm_ctrl <- trainControl(
+  method = "cv",
+  number = 5,
+  verboseIter = FALSE,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final"
+)
+
+# save a copy we don't modify train_data for other models
+train_data_rfe <- train_data
+train_data_rfe$side <- factor(train_data_rfe$side, levels = c(1, 0), labels = c("Buy", "Sell"))
+
+# Hyperparameter tuning
+gbm_tuned <- train(
+  x = train_data_rfe[, gbm_features],
+  y = train_data_rfe$side,
+  method = "gbm",
+  trControl = gbm_ctrl,
+  tuneGrid = gbm_grid,
+  metric = "ROC",
+  verbose = FALSE
+)
+
+gbm_tuned$bestTune
+
+# feature Selection using RFE
+gbm_rfe_ctrl <- rfeControl(
+  functions = caretFuncs,
+  method = "cv",
+  number = 5
+)
+
+gbm_rfe <- rfe(
+  x = train_data_rfe[, gbm_features],
+  y = train_data_rfe$side,
+  sizes = 1:length(gbm_features),
+  rfeControl = gbm_rfe_ctrl,
+  method = "gbm",
+  tuneGrid = gbm_tuned$bestTune,
+  metric = "ROC",
+  trControl = gbm_ctrl
+)
+
+selected_gbm_features <- predictors(gbm_rfe)
+selected_gbm_features
+```
+The selected features primarily capture past inventory levels, recent trading activity, and market conditions, suggesting that the GBM model relies on both inventory management (`balance_lag1`, `deviation_from_mean_balance_diff_lag`, `cumulative_pnl_lag1`, `trade_pnl_lag1`) and recent price and volume dynamics (`fill_prc`, `fill_size`, `fill_qty`, `mid_price_lag1`, `volatility_lag1`). This indicates that the strategy's trade decisions are influenced by a combination of inventory imbalances, recent profits or losses, and short-term market fluctuations.
+
+### Modelling
+
+```{r}
+gbm_final <- train(
+  x = train_data_rfe[, selected_gbm_features],
+  y = train_data_rfe$side,
+  method = "gbm",
+  trControl = gbm_ctrl,
+  tuneGrid = gbm_tuned$bestTune,
+  metric = "ROC",
+  verbose = FALSE
+)
+```
+
+```{r}
+gbm_importance <- summary(gbm_final$finalModel, plotit = FALSE)
+
+ggplot(gbm_importance, aes(x = reorder(var, rel.inf), y = rel.inf)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "GBM Feature Importance",
+       x = "Feature", y = "Relative Influence") +
+  theme_minimal()
+
+gbm_importance[order(-gbm_importance$rel.inf), ]
+```
+
+The feature importance plot reveals that `balance_lag1` and `deviation_from_mean_balance_diff_lag` are the most influential predictors, highlighting the central role of inventory-related information in the strategy's decision-making. Interestingly, lagged trade PnL (`trade_pnl_lag1`) and volatility (`volatility_lag1`) also contribute meaningfully, suggesting that recent profitability and market uncertainty moderately affect the probability of executing buy or sell trades. Price-related variables (`fill_prc`, `mid_price_lag1`) and trade characteristics (`fill_size`, `fill_qty`) play a secondary role, indicating that while trade specifics matter, the strategy is primarily driven by its inventory state.
+
+### Evaluation
+
+```{r}
+test_data_rfe <- test_data
+test_data_rfe$side <- factor(test_data_rfe$side, levels = c(1, 0), labels = c("Buy", "Sell"))
+
+preds_gbm_prob <- predict(gbm_final, newdata = test_data_rfe[, selected_gbm_features], type = "prob")
+
+roc_gbm <- roc(
+  response = test_data_rfe$side,
+  predictor = preds_gbm_prob[,"Buy"]  # Probability of Buy class
+)
+
+plot(roc_gbm, main = "ROC Curve - GBM")
+
+opt_coords_gbm <- coords(
+  roc_gbm,
+  x = "best",
+  ret = c("threshold", "sensitivity", "specificity", "accuracy"),
+  transpose = FALSE
+)
+
+optimal_threshold_gbm <- opt_coords_gbm$threshold
+cat("Optimal Threshold for GBM:", optimal_threshold_gbm, "\n")
+
+predicted_classes_gbm <- ifelse(preds_gbm_prob[,"Buy"] > optimal_threshold_gbm, "Buy", "Sell")
+predicted_classes_gbm <- factor(predicted_classes_gbm, levels = levels(test_data_rfe$side))
+
+cm_gbm_optimized <- confusionMatrix(predicted_classes_gbm, test_data_rfe$side, positive = "Buy")
+cm_gbm_optimized
+```
+
+The GBM model achieved an accuracy of approximately 68%, outperforming the no-information rate of 51.7%, which suggests that it captures meaningful patterns in the data. The balanced accuracy of 68.2% indicates that the model performs similarly across both buy and sell classes, without strong bias. Both sensitivity (69.7%) and specificity (66.7%) are moderately high, showing that the model is relatively balanced in identifying buy and sell trades correctly, though not as well as the logistic model.
+
+Upon observing the features set, I will try removing correlated features, like `balance_lag1` and `deviation_from_mean_balance_diff_lag`, to see if it improves the model's performance.
+
+```{r}
+reduced_features <- c("deviation_from_mean_balance_diff_lag", 
+                      "trade_pnl_lag1", 
+                      "volatility_lag1", 
+                      "fill_size",
+                      "mid_price_lag1")
+
+gbm_final_reduced <- train(
+  x = train_data_rfe[, reduced_features],
+  y = train_data_rfe$side,
+  method = "gbm",
+  trControl = gbm_ctrl,
+  tuneGrid = gbm_tuned$bestTune,
+  metric = "ROC",
+  verbose = FALSE
+)
+
+importance_reduced <- summary(gbm_final_reduced$finalModel, plotit = FALSE)
+importance_gbm <- as.data.frame(importance_reduced)
+
+# plotting feature importance
+ggplot(importance_reduced, aes(x = reorder(var, rel.inf), y = rel.inf)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Reduced GBM Feature Importance",
+       x = "Feature", y = "Relative Influence") +
+  theme_minimal()
+
+# finding optimum threshold
+preds_gbm_reduced_prob <- predict(gbm_final_reduced, newdata = test_data_rfe[, reduced_features], type = "prob")
+
+roc_gbm_reduced <- roc(
+  response = test_data_rfe$side,
+  predictor = preds_gbm_reduced_prob[,"Buy"]  # Probabilities of Buy class
+)
+
+plot(roc_gbm_reduced, main = "ROC Curve - Reduced GBM")
+
+opt_coords_gbm_reduced <- coords(
+  roc_gbm_reduced,
+  x = "best",
+  ret = c("threshold", "sensitivity", "specificity", "accuracy"),
+  transpose = FALSE
+)
+
+optimal_threshold_gbm_reduced <- opt_coords_gbm_reduced$threshold
+cat("Optimal Threshold:", optimal_threshold_gbm_reduced, "\n")
+
+predicted_classes_gbm_reduced <- ifelse(preds_gbm_reduced_prob[,"Buy"] > optimal_threshold_gbm_reduced, "Buy", "Sell")
+predicted_classes_gbm_reduced <- factor(predicted_classes_gbm_reduced, levels = levels(test_data_rfe$side))
+
+cm_gbm <- confusionMatrix(predicted_classes_gbm_reduced, test_data_rfe$side, positive = "Buy")
+cm_gbm
+```
+
+The reduced GBM model, despite using fewer features, achieved a higher accuracy and balanced accuracy, highlighting that thoughtful feature engineering is more valuable than model complexity alone. This result suggests that carefully selecting meaningful features is key to effectively modeling trade behavior.
+
+## Random Forest
+
+Random Forest is an ensemble learning method that builds multiple decision trees and aggregates their predictions, often improving classification performance by reducing variance and mitigating overfitting. In the context of predicting trade direction, random forests are well-suited due to their ability to capture non-linear relationships and handle interactions between variables naturally.
+
+### Feature Selection
+
+Similar to GBM, I will select features using RFE.
+
+```{r}
+temp_rf_train_data <- train_data
+temp_rf_test_data  <- test_data
+
+temp_rf_train_data$side <- factor(temp_rf_train_data$side, levels = c(0, 1), labels = c("Sell", "Buy"))
+temp_rf_test_data$side  <- factor(temp_rf_test_data$side, levels = c(0, 1), labels = c("Sell", "Buy"))
+
+# Recursive Feature Elimination (RFE)
+rfe_ctrl_rf <- rfeControl(functions = rfFuncs, method = "cv", number = 10)
+
+rfe_result_rf <- rfe(
+  x = temp_rf_train_data[, final_logistic_features],
+  y = temp_rf_train_data$side,
+  sizes = 1:length(final_logistic_features),
+  rfeControl = rfe_ctrl_rf
+)
+
+best_rf_features <- predictors(rfe_result_rf)
+best_rf_features
+```
+
+The Random Forest model highlights `deviation_from_mean_balance_diff_lag`, `fill_size`, and `liquidity_Taker` as the most informative features for classifying trade direction. Similar to the models before, this suggests that the strategy's trade decisions are primarily driven by inventory adjustments, trade sizes, and whether the trade is a taker, reflecting both internal risk management and execution conditions.
+
+```{r}
+rf_train_ctrl <- trainControl(method = "cv", number = 10, classProbs = TRUE)
+mtry_grid_rf <- expand.grid(mtry = seq(1, length(best_rf_features)))
+
+rf_formula <- as.formula(paste("side ~", paste(best_rf_features, collapse = " + ")))
+
+rf_tuned <- train(
+  rf_formula,
+  data = temp_rf_train_data,
+  method = "rf",
+  metric = "Accuracy",
+  trControl = rf_train_ctrl,
+  tuneGrid = mtry_grid_rf
+)
+
+rf_tuned$bestTune
+```
+
+The model selects `mtry = 1`, meaning that only one feature is randomly sampled at each tree split, which suggests that the model performs best when considering features independently rather than relying on interactions. This may reflect the dominance of a single strong predictor such as `deviation_from_mean_balance_diff_lag` in driving trade decisions.
+
+### Modelling
+
+```{r}
+best_mtry_rf <- rf_tuned$bestTune$mtry
+
+rf_model <- randomForest(
+  formula = rf_formula,
+  data = temp_rf_train_data,
+  mtry = best_mtry_rf,
+  importance = TRUE
+)
+
+rf_model
+```
+
+### Evaluation
+
+```{r}
+rf_probs <- predict(rf_model, newdata = temp_rf_test_data, type = "prob")[, "Buy"]
+
+roc_rf <- roc(response = temp_rf_test_data$side, predictor = rf_probs)
+plot(roc_rf, main = "ROC Curve - Random Forest")
+
+opt_coords_rf <- coords(
+  roc_rf,
+  x = "best",
+  ret = c("threshold", "sensitivity", "specificity", "accuracy"),
+  transpose = FALSE
+)
+
+opt_coords_rf
+
+optimal_threshold_rf <- opt_coords_rf$threshold
+rf_preds_thresh <- ifelse(rf_probs > optimal_threshold_rf, "Buy", "Sell")
+rf_preds_thresh <- factor(rf_preds_thresh, levels = c("Sell", "Buy"))
+
+cm_rf <- confusionMatrix(rf_preds_thresh, temp_rf_test_data$side, positive = "Buy")
+cm_rf
+```
+
+```{r}
+importance_rf <- importance(rf_model)
+importance_rf <- as.data.frame(importance_rf)
+importance_rf$Feature <- rownames(importance_rf)
+
+importance_rf %>%
+  arrange(desc(MeanDecreaseGini)) %>%
+  ggplot(aes(x = reorder(Feature, MeanDecreaseGini), y = MeanDecreaseGini)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Feature Importance - Random Forest Classification", x = "Feature", y = "Importance") +
+  theme_minimal()
+```
+
+The random forest model achieves an accuracy of approximately 68.25%, which is comparable to the previous models, but without showing a significant improvement. Its feature importance ranking closely mirrors that of logistic regression, with `deviation_from_mean_balance_diff_lag` and `fill_size` remaining the primary drivers. This suggests that the performance ceiling is likely due to the limited explanatory power of the available features rather than the choice of classification algorithm.
+
+## Conclusion
+
+```{r}
+library(reshape2)
+
+model_names <- c("Logistic", "Ridge", "GBM", "Random Forest")
+
+accuracy_values <- c(
+  cm_logit$overall["Accuracy"],
+  cm_ridge$overall["Accuracy"],
+  cm_gbm$overall["Accuracy"],
+  cm_rf$overall["Accuracy"]
+)
+
+kappa_values <- c(
+  cm_logit$overall["Kappa"],
+  cm_ridge$overall["Kappa"],
+  cm_gbm$overall["Kappa"],
+  cm_rf$overall["Kappa"]
+)
+
+roc_values <- c(
+  as.numeric(roc_logit$auc),
+  as.numeric(roc_ridge$auc),
+  as.numeric(roc_gbm_reduced$auc),
+  as.numeric(roc_rf$auc)
+)
+
+model_metrics <- data.frame(
+  Model = model_names,
+  Accuracy = accuracy_values,
+  Kappa = kappa_values,
+  ROC_AUC = roc_values
+)
+
+model_metrics
+
+metrics_long <- reshape2::melt(model_metrics, id.vars = "Model")
+
+ggplot(metrics_long, aes(x = Model, y = value, fill = variable)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.9)) +
+  geom_text(aes(label = round(value, 3)), 
+            position = position_dodge(width = 0.9), 
+            vjust = -0.25, size = 3) +
+  labs(title = "Classification Model Comparison",
+       y = "Metric Value", x = "Model", fill = "Metric") +
+  theme_minimal()
+```
+
+The results show that all models achieve similar levels of accuracy and ROC AUC, with GBM slightly outperforming the others, but only marginally. This suggests that the predictive power is primarily driven by the informative features engineered during preprocessing, reinforcing that thoughtful feature engineering is more critical than the specific choice of classification model in this context.
+
+```{r}
+ggplot(lasso_df, aes(x = reorder(Feature, Coefficient), y = Coefficient)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "LASSO Logistic Regression Feature Importance",
+       x = "Feature", y = "Coefficient") +
+  theme_minimal()
+
+ggplot(importance_reduced, aes(x = reorder(var, rel.inf), y = rel.inf)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Reduced GBM Feature Importance",
+       x = "Feature", y = "Relative Influence") +
+  theme_minimal()
+
+importance_rf %>%
+  arrange(desc(MeanDecreaseGini)) %>%
+  ggplot(aes(x = reorder(Feature, MeanDecreaseGini), y = MeanDecreaseGini)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Feature Importance - Random Forest Classification", x = "Feature", y = "Importance") +
+  theme_minimal()
+```
+
+The results of the classification models provide valuable insight into the factors driving the strategy's buy and sell decisions. Across all models, the strategy's behavior is primarily driven by recent changes in inventory imbalance (`deviation_from_mean_balance_diff_lag`) and trade size (`fill_size`), which indicate that the strategy tends to continue building existing inventory positions rather than quickly reversing them. Additionally, features such as recent trade profitability (`trade_pnl_lag1`) and market volatility (`volatility_lag1`) play smaller but consistent roles, suggesting that the strategy is also influenced by short-term market conditions and its own recent performance. Overall, the models reveal that the strategy exhibits a momentum-like pattern, where its trade direction is closely linked to its inventory dynamics and past trading outcomes.
+
+## Future Work
+
+Building on the insights gained from this study, future work could aim to better capture the underlying drivers of the strategy's buy and sell decisions by engineering features that more fully describe the trading environment. For example, incorporating measures of market pressure (buying vs. selling intensity), trade aggressiveness, or signs of hidden supply and demand could help the models better explain the strategy's actions. Further, integrating temporal patterns, such as moving averages or volatility regimes, may provide context for when and why the strategy adapts its behavior. Finally, exploring more advanced modeling techniques, like recurrent neural networks or attention-based models, could improve the ability to capture sequential and dynamic patterns in the strategy's decision-making.
+
+# Modelling Profit and Loss
+
+Next, I will proceed to my second research question, which is to identify the key factors that influence whether the strategy makes or loses money. Since the data consists of time-series observations, it is essential to first verify that it satisfies key time-series properties before developing a predictive model.
+
+## Time-Series Analysis
+
+### Stationarity and Autocorrelation
+
+Commonly, many financial time series features such as `mid_price`, `cumulative_pnl`, and `balance` are non-stationary, meaning their statistical properties change over time. In this section, I will check for stationarity and apply appropriate transformations, such as differencing or smoothing, if necessary. This step is crucial, as non-stationarity can bias statistical models and lead to unreliable or misleading inferences.
+
+```{r}
+# prepare the timestamp data
+regression.data <- merged_data %>% arrange(timestamp)
+```
+
+```{r}
+colnames(regression.data)
+```
+
+From our available features in `merged_data`, the relevant features to investigate for starionarity and autocorrelation are `bid_prc`, `ask_prc`, `fill_prc`, `fill_qty`, `fee`, `balance`, `mid_price`, `q_i`, `cumulative_pnl`.
+
+```{r}
+# performing ADF tests to check if stationary
+features_to_test <- c("bid_prc", "ask_prc", "fill_prc", "fill_qty", 
+                      "fee", "balance", "mid_price", "q_i", "cumulative_pnl")
+
+for (feature in features_to_test) {
+  cat("ADF Test for", feature, "- p-value:")
+  test_result <- tryCatch({
+    adf.test(regression.data[[feature]], alternative = "stationary")$p.value
+  }, error = function(e) {
+    NA
+  })
+  cat(test_result, "\n")
+}
+```
+
+The ADF test results indicate that mid price and cumulative PnL are non-stationary, meaning their statistical properties change over time, which can distort model performance. To address this, we apply first-order differencing to mid price and use changes in cumulative PnL (equivalent to trade PnL) to achieve stationarity. Inventory balance is already stationary, so it can be used directly without transformation.
+
+The ADF test results also show that `bid_prc`, `ask_prc`, and `fill_prc` are non-stationary, so they should be differenced before use in models that assume stationarity. On the other hand, `fill_qty`, `fee`, and `q_i` are stationary based on their low p-values, meaning they can be used as is.
+
+```{r}
+regression.data$bid_prc_diff <- c(NA, diff(regression.data$bid_prc))
+regression.data$ask_prc_diff <- c(NA, diff(regression.data$ask_prc))
+regression.data$fill_prc_diff <- c(NA, diff(regression.data$fill_prc))
+
+# ADF tests after differencing
+adf_bid_diff <- adf.test(na.omit(regression.data$bid_prc_diff), alternative = "stationary")
+cat("ADF Test after Differencing - Bid Price: p-value =", adf_bid_diff$p.value, "\n")
+
+adf_ask_diff <- adf.test(na.omit(regression.data$ask_prc_diff), alternative = "stationary")
+cat("ADF Test after Differencing - Ask Price: p-value =", adf_ask_diff$p.value, "\n")
+
+adf_fill_diff <- adf.test(na.omit(regression.data$fill_prc_diff), alternative = "stationary")
+cat("ADF Test after Differencing - Fill Price: p-value =", adf_fill_diff$p.value, "\n")
+
+par(mfrow = c(2, 3))
+acf(na.omit(regression.data$bid_prc_diff), main = "ACF: Bid Price Diff", lag.max = 50)
+pacf(na.omit(regression.data$bid_prc_diff), main = "PACF: Bid Price Diff", lag.max = 50)
+
+acf(na.omit(regression.data$ask_prc_diff), main = "ACF: Ask Price Diff", lag.max = 50)
+pacf(na.omit(regression.data$ask_prc_diff), main = "PACF: Ask Price Diff", lag.max = 50)
+
+acf(na.omit(regression.data$fill_prc_diff), main = "ACF: Fill Price Diff", lag.max = 50)
+pacf(na.omit(regression.data$fill_prc_diff), main = "PACF: Fill Price Diff", lag.max = 50)
+par(mfrow = c(1, 1))
+
+ggplot(data = regression.data, aes(x = timestamp, y = bid_prc_diff)) +
+  geom_line(color = "blue") +
+  labs(title = "Bid Price Diff Over Time", x = "Timestamp", y = "Bid Price Diff") +
+  theme_minimal()
+
+ggplot(data = regression.data, aes(x = timestamp, y = ask_prc_diff)) +
+  geom_line(color = "red") +
+  labs(title = "Ask Price Diff Over Time", x = "Timestamp", y = "Ask Price Diff") +
+  theme_minimal()
+
+ggplot(data = regression.data, aes(x = timestamp, y = fill_prc_diff)) +
+  geom_line(color = "green") +
+  labs(title = "Fill Price Diff Over Time", x = "Timestamp", y = "Fill Price Diff") +
+  theme_minimal()
+```
+
+After first-order differencing, bid price, ask price, and fill price are now stationary, as indicated by their ADF test p-values being below 0.01.
+
+```{r}
+regression.data$mid_price_diff <- c(NA, diff(regression.data$mid_price))
+adf_price_diff <- adf.test(na.omit(regression.data$mid_price_diff), alternative = "stationary")
+cat("ADF Test after Differencing - p-value:", adf_price_diff$p.value, "\n")
+
+par(mfrow = c(2, 2))
+acf(regression.data$mid_price, main = "ACF: Mid Price (Raw)", lag.max = 50)
+pacf(regression.data$mid_price, main = "PACF: Mid Price (Raw)", lag.max = 50)
+acf(na.omit(regression.data$mid_price_diff), main = "ACF: Differenced Mid Price", lag.max = 50)
+pacf(na.omit(regression.data$mid_price_diff), main = "PACF: Differenced Mid Price", lag.max = 50)
+par(mfrow = c(1, 1))
+
+ggplot(data = regression.data, aes(x = timestamp, y = mid_price_diff)) +
+  geom_line(color = "blue") + 
+  labs(title = "Mid Price Diff Over Time", x  = "Timestamp", y = "Mid Price Diff") + 
+  theme_minimal()
+
+adf_trade_pnl <- adf.test(na.omit(regression.data$trade_pnl), alternative = "stationary")
+cat("ADF Test after Differencing - p-value:", adf_trade_pnl$p.value, "\n")
+  
+# ACF and PACF Plots
+par(mfrow = c(2, 2))
+acf(regression.data$cumulative_pnl, main = "ACF: Cumulative PnL (Raw)", lag.max = 50)
+pacf(regression.data$cumulative_pnl, main = "PACF: Cumulative PnL (Raw)", lag.max = 50)
+acf(na.omit(regression.data$trade_pnl), main = "ACF: Differenced PnL", lag.max = 50)
+pacf(na.omit(regression.data$trade_pnl), main = "PACF: Differenced PnL", lag.max = 50)
+par(mfrow = c(1, 1))
+
+ggplot(data = regression.data, aes(x = timestamp, y = trade_pnl)) + 
+  geom_line(color = "blue") + 
+  labs(title = "Trade PnL Over Time", x  = "Timestamp", y = "Trade PnL") + 
+  theme_minimal()
+```
+
+After first order differencing, we can see that mid price and trade PnL are also stationary variables. With that, we can see that all of our relevant variables are stationary.
+
+Next, I will check if my target variable, `trade_pnl` has autocorrelation.
+
+```{r}
+dw_pnl <- lm(trade_pnl ~ lag(trade_pnl, 1), data = regression.data)
+dw_test <- dwtest(dw_pnl)
+cat("Durbin-Watson Test for Autocorrelation in Trade PnL - p-value:", dw_test$p.value, "\n")
+```
+
+The Durbin-Watson test indicates that there is no strong evidence of autocorrelation in trade PnL.
+
+### Trends and Seasons
+
+Next, I will investigate whether my target variable, trade PnL, exhibits hidden seasonality. Previously, the trade PnL plot did not show any obvious seasons. However, the timestamps in the datasets are not even and seasons may not align with common periods like hours or days. For this reason, I will use the fourier transform to detect potential seasons. 
+
+```{r}
+spectrum(regression.data$trade_pnl, main="Spectral Density of Trade PnL")
+```
+
+The spectrum looks mostly flat with no clear dominant peaks. This suggests that there is no strong periodic component in trade PnL. Any seasonal effects are likely weak or overshadowed by noise. 
+
+Following this, I will use the Man-Kendall test to verify if there are any trends in trade PnL.
+
+```{r}
+mk.test(regression.data$trade_pnl)
+```
+
+The Man-Kendall test shows that there exists a trend in trade PnL. I will de-trend trade PnL by applying first-order differencing. 
+
+```{r}
+regression.data$trade_pnl_diff <- c(NA, diff(regression.data$trade_pnl))
+mk.test(na.omit(regression.data$trade_pnl_diff))
+```
+
+After first-order differencing, we can see that there is no more evidence of a significant long-term trend in trade PnL. 
+
+I will check if my target variable is stationary around a deterministic trend (trend-stationary) using the KPSS test.
+
+```{r}
+kpss.test(regression.data$trade_pnl_diff)
+```
+
+The KPSS test shows that `trade_pnl_diff` is trend-stationary. 
+
+### Structural Changes 
+
+Lastly, I will check if there are breakpoints in the target variable `trade_pnl_diff` and if I may need to segregate the time series data. To do this, I will apply a structural break analysis using the Bai-Perron multiple breakpoint test.
+
+```{r}
+bp_trade_pnl_diff_model <- breakpoints(regression.data$trade_pnl_diff ~ 1)
+
+plot(bp_trade_pnl_diff_model)
+summary(bp_trade_pnl_diff_model)
+```
+
+The analysis suggests that while potential breakpoints exist, the constant RSS and increasing BIC indicate no meaningful improvement in model fit. Therefore, I will not include breakpoints, as there is no strong evidence of structural changes and the time series appears stable over time.
+
+## Feature Engineering
+
+With the results of the time series analysis, I can now proceed with predictive modeling. I will begin by exploring potential predictors and engineering new features such as spread and volatility. 
+
+### Spread
+
+Spread is defined as the difference between the price at which people sell an asset and the price at which people buy an asset. Since market makers make buy and sell trades at the same time, they profit from the spread. 
+
+```{r}
+regression.data <- regression.data %>%
+  mutate(
+    spread = (ask_prc - bid_prc)
+  )
+```
+
+```{r}
+adf_spread <- adf.test(regression.data$spread, alternative = "stationary")
+cat("ADF Test for Spread - p-value:", adf_spread$p.value, "\n")
+```
+
+The ADF test shows that spread is stationary, so no transformation is needed. Since autocorrelation in predictors does not violate OLS assumptions, we do not need to check for autocorrelation in spread.
+
+```{r}
+ggplot(na.omit(regression.data), aes(x = spread, y = trade_pnl_diff)) + 
+  geom_point(color = "blue") + 
+  geom_smooth(method = "lm", color = "red", se = FALSE) +  
+  labs(title = "Trade PnL Diff vs. Spread",
+       x = "Spread (US$)",
+       y = "Trade PnL Diff (US$)") + 
+  theme_minimal()
+```
+
+The scatter plot shows no clear linear relationship between spread and trade PnL difference. Although the regression line has a slight upward slope, the data is densely clustered near zero, and variation in trade PnL remains high across spread values, suggesting spread does not strongly influence trade PnL difference.
+
+### Fees
+
+Subsequently, fees are an important component to PnL. In the trading business, fees are the costs. 
+
+```{r}
+adf_fee <- adf.test(regression.data$fee, alternative = "stationary")
+cat("ADF Test for Fee - p-value:", adf_fee$p.value, "\n")
+```
+
+The ADF test shows that fee is stationary.
+
+```{r}
+ggplot(data = na.omit(regression.data), aes(x = fee, y = trade_pnl_diff)) + 
+  geom_point(color = "blue") + 
+  geom_smooth(method = "lm", color = "red", se = FALSE) + 
+  labs(title = "Trade PnL Diff vs. Fees",
+       x = "Fees (US$)",
+       y = "Trade PnL Diff (US$)") + 
+  theme_minimal()
+```
+
+The regression line on the scatter plot shows a weak linear relationship between fee and trade PnL difference. Furthermore, the data points are tightly clustered around a few specific fee levels, which limits the reliability of any inference.
+
+### Fill Size
+
+Here, I investigate whether trade PnL difference is influenced by the size of the fill. Fill size is defined as `fill_qty * fill_prc`, where a positive value indicates a buy trade and a negative value indicates a sell trade.
+
+```{r}
+regression.data <- regression.data %>% 
+  mutate(
+    fill_size = q_i * fill_prc
+    )
+```
+
+```{r}
+adf_fill_size <- adf.test(regression.data$fill_size, alternative = "stationary")
+cat("ADF Test for Fill Size - p-value:", adf_fill_size$p.value, "\n")
+```
+
+The ADF test shows that fill size is stationary.
+
+```{r}
+ggplot(na.omit(regression.data), aes(x = fill_size, y = trade_pnl_diff)) + 
+  geom_line(color = "blue") + 
+  geom_smooth(method = "lm", color = "red", se = FALSE) +
+  labs(title = "Trade PnL Diff vs. Fill Size",
+       x = "Fill Size (US$)",
+       y = "Trade PnL Diff (US$)") + 
+  theme_minimal()
+```
+
+The red regression line on the scatterplot shows that there is a weak linear relationship between fill size and trade PnL diff.
+
+### Deviation from Mean Inventory Balance
+
+One important component in market making trading strategies is inventory management. Here, I want to investigate if deviation from the average inventory balance has any impact on profit and loss. The reason why I might believe that deviation from mean inventory balance might have an impact on profit or loss is that if we hold excessively more or less inventory than normal, we become exposed to directional risk. For example, if we hold too much inventory, we are more at risk if prices fall, and if we hold too little inventory, we will lose out on potential gains if prices rise. 
+
+```{r}
+mean_inventory_balance <- mean(regression.data$balance)
+mean_inventory_balance
+```
+
+```{r}
+regression.data <- regression.data %>% mutate(
+  deviation_from_mean_balance = balance - mean_inventory_balance
+)
+```
+
+```{r}
+adf_deviation_from_mean_inventory_balance <- adf.test(
+  regression.data$deviation_from_mean_balance,
+  alternative = "stationary"
+  )
+
+cat("ADF Test for Deviation from Deviation from Mean Inventory Balance - p-value:",
+    adf_deviation_from_mean_inventory_balance$p.value, "\n"
+    )
+```
+
+The ADF test shows that deviation from mean inventory balance is stationary.
+
+```{r}
+ggplot(na.omit(regression.data), aes(x = deviation_from_mean_balance, y = trade_pnl_diff)) + 
+  geom_line(color = "blue") + 
+  geom_smooth(method = "lm", color = "red", se = FALSE) +
+  labs(title = "Trade PnL Diff vs. Deviation from Mean Inventory Balance",
+       x = "Deviation from Mean Inventory Balance",
+       y = "Trade PnL Diff (US$)") + 
+  theme_minimal()
+```
+The red regression line on the scatterplot shows that there is no linear relationship between deviation from mean inventory balance and trade PnL diff. 
+
+### Deviation from Mean Market Price 
+
+Next, I will take the difference of the mid price with the mean market price and see if there is any correlation with profit and loss. 
+
+```{r}
+mean_mid_price <- mean(regression.data$mid_price)
+mean_mid_price
+```
+
+```{r}
+regression.data <- regression.data %>% mutate(
+  deviation_from_mean_mid_price = mid_price - mean_mid_price
+)
+```
+
+```{r}
+adf_deviation_from_mean_mid_price <- adf.test(
+  regression.data$deviation_from_mean_mid_price,
+  alternative = "stationary"
+  )
+
+cat("ADF Test for Deviation from Deviation from Mean Mid Price - p-value:",
+    adf_deviation_from_mean_mid_price$p.value, "\n"
+    )
+```
+
+```{r}
+regression.data$deviation_from_mean_mid_price_diff <- c(
+  NA, diff(regression.data$deviation_from_mean_mid_price)
+  )
+
+adf_deviation_from_mean_mid_price_diff <- adf.test(
+  na.omit(regression.data$deviation_from_mean_mid_price_diff), alternative = "stationary"
+  )
+
+cat("ADF Test after Differencing - p-value:", adf_price_diff$p.value, "\n")
+```
+
+The ADF test shows that deviation from mean mid price is non-stationary. Applying first-order differencing solved this issue.
+
+```{r}
+ggplot(na.omit(regression.data), aes(x = deviation_from_mean_mid_price_diff, y = trade_pnl_diff)) + 
+  geom_line(color = "blue") + 
+  geom_smooth(method = "lm", color = "red", se = FALSE) +
+  labs(title = "Trade PnL Diff vs. Deviation from Mean Mid Price Diff",
+       x = "Deviation from Mean Mid Price Diff (US$)",
+       y = "Trade PnL Diff (US$)") + 
+  theme_minimal()
+```
+
+The red regression line on the scatterplot shows that there is a very weak linear relationship between deviation from mean mid price diff and trade PnL diff. 
+
+### Volatility
+
+To capture market conditions, I engineered a volatility feature based on the rolling standard deviation of mid prices. First, I created a copy of the market data to avoid modifying the original dataset. I then calculated the mid price as the average of bid and ask prices at each timestamp. Using a 20-period rolling window, I computed the standard deviation of the mid price to represent short-term market volatility. Finally, I merged this volatility measure into the main regression dataset by timestamp so it could be used as a predictor in subsequent modeling.
+
+```{r}
+volatility_data <- market_data %>%
+  mutate(mid_price = (bid_prc + ask_prc) / 2)
+
+volatility_data <- volatility_data %>%
+  arrange(timestamp) %>%
+  mutate(volatility = rollapply(mid_price, width = 20, FUN = sd, fill = NA, align = "right"))
+```
+
+```{r}
+# joining the volatility back into regression.data by timestamp
+setDT(regression.data)
+setDT(volatility_data)
+
+setkey(regression.data, timestamp)
+setkey(volatility_data, timestamp)
+
+regression.data <- volatility_data[, .(timestamp, volatility)][regression.data, roll = Inf]
+```
+
+```{r}
+adf_volatility <- adf.test(regression.data$volatility, alternative = "stationary")
+
+cat("ADF Test for Volatility - p-value:", adf_volatility$p.value, "\n")
+```
+
+The ADF test shows that volatility is stationary. 
+
+```{r}
+ggplot(na.omit(regression.data), aes(x = volatility, y = trade_pnl_diff)) + 
+  geom_point(color = "blue") + 
+  geom_smooth(method = "lm", color = "red", se = FALSE) +
+  labs(title = "Trade PnL Diff vs. Volatility",
+       x = "Volatility (Rolling Std Dev of Mid Price)",
+       y = "Trade PnL Diff (US$)") + 
+  theme_minimal()
+```
+
+The red regression line on the scatterplot shows that there is no linear relationship between volatility and trade PnL diff.
+
+## Predictive Modelling
+
+After exploring and engineering our features, I will remove outliers in the dataset using the IQR method, scale the features, and clean up any unnecessary columns. 
+
+```{r}
+regression.data <- na.omit(regression.data) # remove the first row, which has NA values due to first-order differencing
+
+# filter out outliers using the IQR method
+Q1 <- quantile(regression.data$trade_pnl_diff, 0.25)
+Q3 <- quantile(regression.data$trade_pnl_diff, 0.75)
+IQR_value <- Q3 - Q1
+
+lower_bound <- Q1 - 1.5 * IQR_value
+upper_bound <- Q3 + 1.5 * IQR_value
+
+original_count <- nrow(regression.data)
+
+outliers <- which(regression.data$trade_pnl_diff < lower_bound | regression.data$trade_pnl_diff > upper_bound)
+
+num_outliers <- length(outliers)
+
+cat("Number of outliers removed:", num_outliers, "\n")
+
+remaining_count <- original_count - num_outliers
+cat("Remaining observations after outlier removal:", remaining_count, "\n")
+
+regression.data <- regression.data %>%
+  filter(trade_pnl_diff >= lower_bound & trade_pnl_diff <= upper_bound)
+```
+
+```{r}
+# ignore q_i since it is the same as fill_qty
+features = c("fee", "spread", "fill_size", "deviation_from_mean_balance",
+             "deviation_from_mean_mid_price_diff", "bid_prc_diff",
+             "ask_prc_diff", "side", "fill_prc_diff", "fill_qty",
+             "liquidity", 'balance', "mid_price_diff", "volatility")
+
+categorical_vars <- c("side", "liquidity")
+numeric_vars <- setdiff(features, categorical_vars)  
+
+scaled_numeric <- as.data.frame(scale(regression.data[, ..numeric_vars]))  # Use `..` before numeric_vars
+
+categorical_data <- as.data.frame(regression.data[, ..categorical_vars])
+
+scaled_data <- cbind(scaled_numeric, categorical_data)
+
+# target variable
+scaled_data$trade_pnl_diff <- regression.data$trade_pnl_diff
+```
+
+Furthermore, I will apply one-hot encoding to our categorical variables. 
+
+```{r}
+library(fastDummies)
+scaled_data_encoded <- dummy_cols(scaled_data,
+                                  select_columns = categorical_vars,
+                                  remove_first_dummy = TRUE,
+                                  remove_selected_columns = TRUE)
+str(scaled_data_encoded)
+head(scaled_data_encoded)
+```
+
+```{r}
+features = c("fee", "spread", "fill_size", "deviation_from_mean_balance",
+             "deviation_from_mean_mid_price_diff", "bid_prc_diff",
+             "ask_prc_diff", "side_S", "fill_prc_diff", "fill_qty",
+             "liquidity_Taker", 'balance', "mid_price_diff", "volatility")
+```
+
+After cleaning up the data, we can crate training and testing sets for predictive modelling. 
+
+```{r}
+trainIndex <- createDataPartition(scaled_data_encoded$trade_pnl_diff, p = 0.8, list = FALSE)
+
+# Create training and testing sets
+train_data <- scaled_data_encoded[trainIndex, ]
+test_data <- scaled_data_encoded[-trainIndex, ]
+
+cat("Training Set Size:", nrow(train_data), "rows\n")
+cat("Testing Set Size:", nrow(test_data), "rows\n")
+
+str(train_data)
+str(test_data)
+```
+
+### Multiple Linear Regression
+
+I will begin by implementing a baseline multiple linear regression model to assess the relationship between trade PnL difference and the selected explanatory variables.
+
+#### Feature Selection
+
+I will compare two multiple linear regression models: one using a combination of features that minimizes multicollinearity, and the other based on feature selection via best subset selection.
+
+```{r}
+# first check for perfectly colinear features
+alias(lm(as.formula(paste("trade_pnl_diff ~", paste(features, collapse=" + ")))
+         , data = scaled_data_encoded))$Complete
+```
+
+The matrix shows that `ask_prc_diff`, `bid_prc_diff`, `deviation_from_mean_mid_price_diff`, and `mid_price_diff` are perfectly colinear. I will keep mid price and remove the other features. Furthermore, `balance` is colinear with `deviation_from_mean_balance`, and `fill_qty` and `fill_prc_diff` is correlated with `fill_size`.
+
+```{r}
+best_vif_features <- setdiff(features, c("ask_prc_diff", "bid_prc_diff", "deviation_from_mean_mid_price_diff", "balance", "fill_qty", "fill_prc_diff"))
+```
+
+```{r}
+vif_formula <- as.formula(paste("trade_pnl_diff ~",
+                                    paste(best_vif_features,
+                                          collapse=" + ")))
+
+vif_model <- lm(vif_formula, data = scaled_data_encoded)
+
+vif(vif_model)
+```
+
+All features have VIF values below 10, indicating no severe multicollinearity, so no further pruning is necessary.
+
+```{r}
+numerical_best_features <- setdiff(best_vif_features, c("liquidity_Taker", "side_S"))
+
+for (feature in numerical_best_features) {
+  print(
+    ggplot(scaled_data_encoded, aes_string(x = feature, y = "trade_pnl_diff")) + 
+      geom_point(alpha = 0.5, color = "blue") + 
+      geom_smooth(method = "lm", color = "red", se = FALSE) +  
+      labs(title = paste("Trade PnL Diff vs.", feature),
+           x = feature, y = "Trade PnL Diff (US$)") + 
+      theme_minimal()
+  )
+}
+```
+
+Based on our previous analysis and the scatterplot, `deviation_from_mean_balance` does not exhibit a clear linear relationship with trade PnL difference, violating the linearity assumption of OLS. Therefore, I have excluded it from the feature set. 
+
+```{r}
+best_vif_features <- best_vif_features[best_vif_features != "deviation_from_mean_balance"]
+best_vif_features
+```
+
+#### Modelling
+
+With this adjustment, the final selection of features minimizes multicollinearity and satisfies the linearity assumption. Additionally, I have removed outliers using the IQR method and applied scaling and normalization to all numerical features to ensure consistency in modeling.
+
+```{r}
+mlr.fit <- lm(as.formula(paste("trade_pnl_diff", "~",
+             paste(best_vif_features, collapse=" + "))),
+             data = train_data) # use training set
+summary(mlr.fit)
+```
+
+#### Evaluation
+
+```{r}
+plot(mlr.fit, which = 1)  # Residuals vs. Fitted
+plot(mlr.fit, which = 2)  # Q-Q Plot for normality
+dwtest(mlr.fit) # Test for autocorrelation in residuals
+```
+The Residuals vs Fitted plot shows that there are two distinct clusters of residuals, suggesting that the model might be missing a key categorical or structural component. This pattern often indicates the presence of a binary or grouped predictor variable, which is not properly accounted for. Furthermore, the Q-Q plot of residuals shows heavy tails, suggesting that the residuals deviate from normality, particularly in the extremes. Finally, the Durbin-Watson test result `(DW = 2.6091, p-value = 1)` indicates that there is no significant autocorrelation in residuals, meaning the assumption of independent errors holds.
+
+```{r}
+formula_best <- as.formula(paste("trade_pnl_diff ~", paste(best_vif_features, collapse = " + ")))
+
+train_control <- trainControl(method = "cv", number = 10, savePredictions = "final")
+
+cv_model <- caret::train(
+  formula_best,
+  data = train_data,
+  method = "lm",
+  trControl = train_control
+)
+
+print(cv_model)
+
+test_predictions <- predict(cv_model$finalModel, newdata = test_data)
+
+cv_predictions <- cv_model$pred$pred
+
+evaluate_model <- function(actual, predicted) {
+  data.frame(
+    RMSE = RMSE(predicted, actual),
+    MAE = MAE(predicted, actual),
+    MAPE = mape(predicted, actual)
+  )
+}
+
+test_metrics <- evaluate_model(test_data$trade_pnl_diff, test_predictions)
+oob_metrics <- evaluate_model(train_data$trade_pnl_diff, cv_predictions)
+
+adj_r2 <- summary(cv_model$finalModel)$adj.r.squared
+
+mlr_metrics_df <- tibble(
+  Metric = c("RMSE", "OOB RMSE", "MAE", "OOB MAE", "MAPE", "Adjusted R-Squared"),
+  Value = c(test_metrics$RMSE, oob_metrics$RMSE,
+            test_metrics$MAE, oob_metrics$MAE,
+            test_metrics$MAPE, adj_r2)
+)
+
+print(mlr_metrics_df)
+
+ggplot(filter(mlr_metrics_df, Metric != "MAPE"), aes(x = reorder(Metric, -Value), y = Value, fill = Metric)) +
+  geom_bar(stat = "identity") +
+  labs(title = "MLR Performance Metrics (Test & CV)", x = "Metric", y = "Value") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+# Plot for MAPE separately since different units
+mape_df <- mlr_metrics_df %>% filter(Metric == "MAPE")
+
+ggplot(mape_df, aes(x = Metric, y = Value, fill = Metric)) +
+  geom_bar(stat = "identity", width = 0.5) +
+  labs(title = "Mean Absolute Percentage Error (MAPE)", x = "", y = "MAPE (%)") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+The model's low Adjusted $R^2$ (0.0571) suggests that the selected features explain only a small portion of the variation in `trade_pnl_diff`, likely due to weak linear relationships observed in the feature plots. While the RMSE (0.0589) and MAE (0.0451) indicate that the model makes small absolute errors, the relatively high MAPE (31.24%) suggests that percentage errors remain substantial—likely inflated by the small magnitude of `trade_pnl_diff` values. The Residuals vs. Fitted plot also reveals potential structural issues, such as missing categorical variables or interaction effects. These findings suggest that moving beyond linear models, such as using tree-based or ensemble methods like GBM or AutoML, may better capture non-linear patterns and improve predictive performance.
+
+#### Best Subset Selection
+
+Next, I will model trade PnL diff using best subset selection and compare its results with the model above. 
+
+```{r}
+library(leaps)
+
+full_formula <- as.formula(paste("trade_pnl_diff ~", paste(features, collapse = " + ")))
+
+subset_model <- regsubsets(full_formula, data = train_data, nvmax = length(features), method = "exhaustive")
+subset_summary <- summary(subset_model)
+
+# choose the best model by lowest BIC
+best_num_vars <- which.min(subset_summary$bic)
+best_features <- names(coef(subset_model, best_num_vars))[-1]  # remove intercept, and safe from multicolinearity
+
+cat("Best subset selected features:", paste(best_features, collapse = ", "), "\n")
+
+subset_formula <- as.formula(paste("trade_pnl_diff ~", paste(best_features, collapse = " + ")))
+
+train_control <- trainControl(method = "cv", number = 10, savePredictions = "final")
+
+cv_model_subset <- caret::train(
+  subset_formula,
+  data = train_data,
+  method = "lm",
+  trControl = train_control
+)
+
+test_predictions_subset <- predict(cv_model_subset$finalModel, newdata = test_data)
+cv_predictions_subset <- cv_model_subset$pred$pred
+
+test_metrics_subset <- evaluate_model(test_data$trade_pnl_diff, test_predictions_subset)
+oob_metrics_subset <- evaluate_model(train_data$trade_pnl_diff, cv_predictions_subset)
+adj_r2_subset <- summary(cv_model_subset$finalModel)$adj.r.squared
+
+subset_metrics_df <- tibble(
+  Metric = c("RMSE", "OOB RMSE", "MAE", "OOB MAE", "MAPE", "Adjusted R-Squared"),
+  Value = c(test_metrics_subset$RMSE, oob_metrics_subset$RMSE,
+            test_metrics_subset$MAE, oob_metrics_subset$MAE,
+            test_metrics_subset$MAPE, adj_r2_subset)
+)
+
+print(subset_metrics_df)
+
+ggplot(filter(subset_metrics_df, Metric != "MAPE"), aes(x = reorder(Metric, -Value), y = Value, fill = Metric)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Best Subset Selection Performance (Test & CV)", x = "Metric", y = "Value") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+mape_df_subset <- subset_metrics_df %>% filter(Metric == "MAPE")
+
+ggplot(mape_df_subset, aes(x = Metric, y = Value, fill = Metric)) +
+  geom_bar(stat = "identity", width = 0.5) +
+  labs(title = "MAPE (Best Subset Selection)", x = "", y = "MAPE (%)") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+The best subset selection model yields a slightly higher Adjusted $R^2$ of 0.0645, suggesting a modest improvement in explaining the variation in `trade_pnl_diff` compared to the previous MLR model. The RMSE (0.0586) and MAE (0.0449) remain low, indicating that the model continues to produce small absolute errors. Notably, the MAPE drops to 9.74%, a significant improvement over the MLR model, which suggests that the model is better at capturing percentage-level accuracy despite the small scale of the target variable. Overall, while predictive power is still limited, the performance gains highlight that better feature selection improves linear model results. 
+
+#### Comparison
+
+```{r}
+mlr_metrics_df$Model <- "MLR"
+subset_metrics_df$Model <- "Best Subset"
+
+combined_metrics_df <- bind_rows(mlr_metrics_df, subset_metrics_df)
+
+ggplot(filter(combined_metrics_df, Metric != "MAPE"), aes(x = Metric, y = Value, fill = Model)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  labs(title = "MLR vs Best Subset Model Performance", x = "Metric", y = "Value") +
+  theme_minimal() +
+  scale_fill_brewer(palette = "Set1")
+
+combined_mape <- combined_metrics_df %>%
+  filter(Metric == "MAPE")
+
+ggplot(filter(combined_metrics_df, Metric == "MAPE"), aes(x = Model, y = Value, fill = Model)) +
+  geom_bar(stat = "identity", width = 0.4) +
+  labs(title = "MAPE Comparison", x = "", y = "MAPE (%)") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+mlr_varimp <- varImp(cv_model, scale = TRUE)$importance %>%
+  mutate(Feature = rownames(.), Model = "MLR")
+
+subset_varimp <- varImp(cv_model_subset, scale = TRUE)$importance %>%
+  mutate(Feature = rownames(.), Model = "Best Subset")
+
+combined_varimp <- bind_rows(mlr_varimp, subset_varimp) %>%
+  arrange(Model, desc(Overall))
+combined_varimp
+
+ggplot(combined_varimp, aes(x = reorder(Feature, Overall), y = Overall, fill = Model)) +
+  geom_col(position = position_dodge(width = 0.7)) +
+  coord_flip() +
+  labs(title = "Variable Importance: MLR vs Best Subset",
+       x = "Feature", y = "Importance (Standardized Coefficient Magnitude)") +
+  theme_minimal()
+```
+The comparison between the MLR and Best Subset models shows that Best Subset consistently outperforms MLR across most metrics. It achieves a higher Adjusted $R^2$ (0.0645 vs 0.0571), indicating slightly better explanatory power. While RMSE and MAE are similar between the two models, the Best Subset model significantly reduces MAPE (9.74% vs 31.24%), suggesting better relative accuracy despite the small scale of `trade_pnl_diff`. Variable importance plots reveal that MLR relies heavily on `spread`, `fee`, and `fill_size`, while Best Subset emphasizes `side_S`, `fill_qty`, and `fee`, highlighting different feature priorities between the models. Overall, the Best Subset model offers more reliable and interpretable performance, supporting the idea that careful feature selection improves linear model effectiveness, though both still show limited predictive power, pointing to the potential benefit of more flexible, non-linear methods.
+
+### Gradient Boosting
+
+The results from multiple linear regression suggest that non-linear models like GBM may show better predictive power.
+
+#### Feature Selection
+
+The assumptions for gradient boosting are more relaxed compared to linear models, but some data considerations still apply. Gradient boosting does not require linear relationships, normally distributed residuals, or homoscedasticity. However, it does assume that the training data is clean, representative, and free from data leakage. It also benefits from having meaningful, well-preprocessed features. The `scaled_data_encoded` dataset already satisfies these conditions: numerical features have been scaled and normalized, categorical variables have been encoded, and outliers have been removed using the IQR method. As such, the data is well-prepared for gradient boosting without needing further transformations.
+
+In selecting the best combination of features for GBM, I will use Recursive Feature Elimination (RFE) to recursively eliminate the least important features until the optimal subset is found. The original set of features will be `features` from above.
+
+```{r}
+library(caret)
+rfe_ctrl <- rfeControl(functions = caretFuncs, # GBM
+                       method = "cv",
+                       number = 5) # computation-accuracy trade off
+
+rfe_result <- rfe(x = scaled_data_encoded[, features],
+                  y = scaled_data_encoded$trade_pnl_diff,
+                  sizes = 1:length(features),
+                  rfeControl = rfe_ctrl,
+                  method = "gbm")
+
+rfe_result$optVariables
+```
+
+#### Modelling
+
+First let us automatically tune GBM parameters using grid search with cross-validation.
+
+```{r}
+best_rfe_features <- rfe_result$optVariables
+
+tune_grid <- expand.grid(
+  n.trees = c(100, 300, 500, 1000), 
+  interaction.depth = c(1, 3, 5, 7), 
+  shrinkage = c(0.01, 0.05, 0.1, 0.2), 
+  n.minobsinnode = c(5, 10, 15)
+)
+
+train_control <- trainControl(
+  method = "cv",
+  number = 10,
+  savePredictions = "final",  
+  returnResamp = "all"
+)
+
+gbm_formula <- as.formula(paste("trade_pnl_diff", "~",
+                                paste(best_rfe_features, collapse=" + ")))
+
+optimized_gbm <- train(
+  gbm_formula, 
+  data = train_data,
+  method = "gbm",
+  trControl = train_control,
+  tuneGrid = tune_grid,
+  verbose = FALSE
+)
+
+optimized_gbm$bestTune
+```
+
+```{r}
+# training the model using the best hyperparameters
+best_gbm_params <- optimized_gbm$bestTune
+
+final_gbm <- gbm(
+  formula = gbm_formula, 
+  data = train_data,
+  distribution = "gaussian",  
+  n.trees = best_gbm_params$n.trees,  
+  interaction.depth = best_gbm_params$interaction.depth,  
+  shrinkage = best_gbm_params$shrinkage,  
+  cv.folds = 10,
+  n.minobsinnode = best_gbm_params$n.minobsinnode,
+  verbose = TRUE
+)
+
+final_gbm
+```
+
+```{r}
+gbm_importance <- summary(final_gbm, plotit = FALSE, scale = TRUE)
+gbm_importance
+
+ggplot(gbm_importance, aes(x = reorder(var, rel.inf), y = rel.inf)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Feature Importance (GBM)",
+       x = "Feature", y = "Relative Influence") +
+  theme_minimal()
+```
+
+The high importance of `fill_prc_diff` (50.02), the first-order difference of fill price, along with `fill_size` (27.16) and `fill_qty` (22.82), indicates that short-term price changes and trade execution size are the most influential factors driving `trade_pnl_diff.`
+
+#### Evaluation
+
+```{r}
+test_predictions <- predict(final_gbm, newdata = test_data, n.trees = best_gbm_params$n.trees)
+test_metrics <- evaluate_model(test_data$trade_pnl_diff, test_predictions)
+
+cv_predictions <- optimized_gbm$pred$pred
+oob_metrics <- evaluate_model(train_data$trade_pnl_diff, cv_predictions)
+
+gbm_r2 <- R2(test_predictions, test_data$trade_pnl_diff)
+n <- nrow(test_data)
+p <- length(best_features)
+gbm_adj_r2 <- 1 - ((1 - gbm_r2) * (n - 1) / (n - p - 1))
+
+gbm_metrics_df <- tibble(
+  Metric = c("RMSE", "OOB RMSE", "MAE", "OOB MAE", "MAPE", "Adjusted R-Squared"),
+  Value = c(test_metrics$RMSE, oob_metrics$RMSE,
+            test_metrics$MAE, oob_metrics$MAE,
+            test_metrics$MAPE, gbm_adj_r2)
+)
+
+gbm_metrics_df
+
+ggplot(filter(gbm_metrics_df, Metric != "MAPE"), 
+       aes(x = reorder(Metric, -Value), y = Value, fill = Metric)) +
+  geom_bar(stat = "identity") +
+  labs(title = "GBM Performance Metrics (Test & CV)", x = "Metric", y = "Value") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+mape_df <- gbm_metrics_df %>% filter(Metric == "MAPE")
+
+ggplot(mape_df, aes(x = Metric, y = Value, fill = Metric)) +
+  geom_bar(stat = "identity", width = 0.5) +
+  labs(title = "Mean Absolute Percentage Error (MAPE)", x = "", y = "MAPE (%)") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+The GBM model shows improved predictive accuracy with a lower RMSE (0.0577), MAE (0.0424), and MAPE (6.98 percent), indicating better absolute and percentage-based predictions compared to MLR and Best Subset. However, the low Adjusted $R^2$ (0.0575) suggests the model still explains little variance in `trade_pnl_diff`. This points to limitations in the current features. With more computing resources, using RFE with additional cross-validation folds may lead to better feature selection and improved model performance. Further feature engineering could also help capture more structure in the data.
+
+### H2O AutoML
+
+Next, I will experiment with H2O AutoML to evaluate a wide range of models and identify the best-performing one based on predictive accuracy. This will allow me to compare ensemble methods, tree-based models, and linear models without manual tuning, and assess which algorithm best captures the underlying structure of `trade_pnl_diff.`
+
+#### Feature Selection
+
+Compared to multiple linear regression, H2O AutoML has far more relaxed assumptions. It does not require linear relationships, normality of residuals, or homoscedasticity, and it can handle multicollinearity and complex interactions automatically. I will use the full set of engineered vector features as input and let H2O AutoML explore a range of models. Since it performs internal feature selection, AutoML can automatically ignore irrelevant variables and select the best-performing model without manual pruning.
+
+#### Modelling
+
+```{r}
+library(h2o)
+
+h2o.init()
+
+h2o_train <- as.h2o(train_data)
+h2o_test <- as.h2o(test_data)
+
+y <- "trade_pnl_diff"
+x <- features
+x
+```
+
+```{r}
+model_counts <- c(5, 10, 15, 20, 25, 30, 35)
+
+h2o_results <- data.frame(Max_Models = integer(), RMSE = numeric(),
+                          MAE = numeric(), MAPE = numeric(), Adj_R2 = numeric())
+
+for (max_mod in model_counts) {
+  cat("\n🔵 Training H2O AutoML with", max_mod, "models...\n")
+  
+  aml_model <- h2o.automl(
+    x = x,
+    y = y,
+    training_frame = h2o_train,
+    max_models = max_mod,
+    nfolds = 5,
+    sort_metric = "RMSE",
+    seed = 123
+    )
+  
+  best_model <- aml_model@leader
+  cat("Best Model for max_models =", max_mod, ":\n")
+  print(best_model)
+
+  algo <- best_model@algorithm
+
+  if (algo %in% c("gbm", "xgboost", "drf")) {
+    cat("Variable Importance:\n")
+    print(h2o.varimp(best_model))
+    }
+
+  if (algo == "glm") {
+    cat("GLM Coefficients:\n")
+    print(h2o.coef(best_model))
+    }
+
+  aml_predictions <- as.vector(h2o.predict(best_model, h2o_test))
+
+  aml_rmse <- RMSE(aml_predictions, test_data$trade_pnl_diff)
+  aml_mae  <- MAE(aml_predictions, test_data$trade_pnl_diff)
+  non_zero_actuals <- abs(test_data$trade_pnl_diff) > 1e-6
+  aml_mape <- mean(abs((test_data$trade_pnl_diff[non_zero_actuals] - aml_predictions[non_zero_actuals]) / 
+                        test_data$trade_pnl_diff[non_zero_actuals])) * 100
+
+  
+  aml_r2 <- 1 - sum((aml_predictions - test_data$trade_pnl_diff)^2) / 
+                 sum((test_data$trade_pnl_diff - mean(test_data$trade_pnl_diff))^2)
+
+  n <- nrow(test_data)
+  p <- length(x)
+
+  adj_r2_aml <- 1 - (1 - aml_r2) * ((n - 1) / (n - p - 1))
+
+  h2o_results <- rbind(h2o_results,
+                       data.frame(Max_Models = max_mod, RMSE = aml_rmse,
+                                  MAE = aml_mae, MAPE = aml_mape,
+                                  Adj_R2 = adj_r2_aml))
+  
+  cat("Results for max_models =", max_mod, ":\n")
+  cat("RMSE:", aml_rmse, "\n")
+  cat("MAE:", aml_mae, "\n")
+  cat("MAPE:", aml_mape, "%\n")
+  cat("Adjusted R-Squared:", adj_r2_aml, "\n")
+}
+```
+
+#### Evaluation
+
+```{r}
+cat("\nFinal Comparison Across All max_models\n")
+print(h2o_results)
+
+ggplot(h2o_results, aes(x = Max_Models, y = RMSE)) +
+  geom_line() + geom_point() +
+  labs(title = "H2O AutoML RMSE vs. Number of Models", x = "Max Models", y = "RMSE") +
+  theme_minimal()
+
+ggplot(h2o_results, aes(x = Max_Models, y = Adj_R2)) +
+  geom_line() + geom_point() +
+  labs(title = "H2O AutoML Adjusted R² vs. Number of Models", x = "Max Models", y = "Adjusted R²") +
+  theme_minimal()
+
+ggplot(h2o_results, aes(x = Max_Models, y = MAE)) +
+  geom_line() + geom_point() +
+  labs(title = "H2O AutoML MAE vs. Number of Models", x = "Max Models", y = "MAE") +
+  theme_minimal()
+
+ggplot(h2o_results, aes(x = Max_Models, y = MAPE)) +
+  geom_line() + geom_point() +
+  labs(title = "H2O AutoML MAPE vs. Number of Models", x = "Max Models", y = "MAPE") +
+  theme_minimal()
+
+ggplot(h2o_results, aes(x = Max_Models, y = MAPE)) +
+  geom_line() + geom_point() +
+  labs(title = "H2O AutoML MAPE vs. Number of Models", x = "Max Models", y = "MAPE") +
+  theme_minimal()
+```
+
+The results from H2O AutoML across varying `max_models` values show consistently low Adjusted $R^2$ scores, with none exceeding 0.02 and several even negative, indicating that the models explain very little of the variance in `trade_pnl_diff`. While RMSE and MAE values remain relatively stable and low, the extremely high MAPE values—ranging from 142% to over 170%—suggest the models struggle with relative accuracy, especially on small-magnitude targets. These findings imply that increasing model complexity through AutoML does not improve predictive performance in this case. Instead, the results suggest that simpler models with thoughtful, domain-driven feature engineering may offer better explanatory power and generalizability than complex, black-box ensemble models.
+
+### Random Forest
+
+Next, I will compare the results of a random forest in modelling trade PnL diff.
+
+#### Feature Selection
+
+To identify the most predictive features for the random forest model, I used Recursive Feature Elimination (RFE) with a 10-fold cross-validation setup. This approach iteratively removes less important variables and selects the subset that minimizes prediction error, based on the internal variable importance from the random forest algorithm.
+
+```{r}
+library(randomForest)
+
+rfe_ctrl <- rfeControl(functions = rfFuncs, # Use random forest specific RFE
+                       method = "cv",
+                       number = 10)
+
+rfe_result <- rfe(x = train_data[, features], # start with features
+                  y = train_data$trade_pnl_diff,
+                  sizes = 1:length(features),
+                  rfeControl = rfe_ctrl)
+
+best_rf_features <- predictors(rfe_result)
+best_rf_features
+```
+
+#### Modelling
+
+Using the features selected by RFE, I trained a random forest model while tuning the mtry parameter, which controls the number of features randomly sampled at each split. The model was trained using 10-fold cross-validation to ensure robust performance estimation and avoid overfitting.
+
+```{r}
+rf_train_ctrl <- trainControl(method = "cv", number = 10)
+
+num_rf_feats <- length(best_rf_features)
+
+mtry_grid <- expand.grid(mtry = seq(1, num_rf_feats))
+
+rf_formula <- as.formula(paste("trade_pnl_diff ~", paste(best_rf_features, collapse = " + ")))
+
+rf_tuned <- train(
+  rf_formula,
+  data = train_data,
+  method = "rf",
+  metric = "RMSE",
+  trControl = rf_train_ctrl,
+  tuneGrid = mtry_grid
+)
+
+rf_tuned$bestTune
+```
+
+```{r}
+best_mtry <- rf_tuned$bestTune$mtry
+
+rf_formula <- as.formula(paste("trade_pnl_diff ~", paste(best_rf_features, collapse = " + ")))
+
+rf_model <- randomForest(
+  rf_formula,
+  data = train_data,
+  mtry = best_mtry,
+  importance = TRUE
+)
+
+rf_model
+```
+
+#### Evaluation
+
+I evaluated the model on the holdout test set using standard regression metrics: RMSE, MAE, MAPE, and Adjusted $R^2$. 
+
+```{r}
+rf_preds <- predict(rf_model, newdata = test_data[, best_rf_features])
+
+rf_metrics <- evaluate_model(test_data$trade_pnl_diff, rf_preds)
+
+n <- nrow(test_data)
+p <- length(best_rf_features)
+r2 <- R2(rf_preds, test_data$trade_pnl_diff)
+rf_adj_r2 <- 1 - (1 - r2) * ((n - 1) / (n - p - 1))
+
+rf_metrics_df <- tibble::tibble(
+  Metric = c("RMSE", "MAE", "MAPE", "Adjusted R-Squared"),
+  Value = c(rf_metrics$RMSE, rf_metrics$MAE, rf_metrics$MAPE, rf_adj_r2)
+)
+
+rf_metrics_df
+
+ggplot(filter(rf_metrics_df, Metric != "MAPE"), 
+       aes(x = reorder(Metric, -Value), y = Value, fill = Metric)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Random Forest Performance Metrics (Test Set)",
+       x = "Metric", y = "Value") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+ggplot(filter(rf_metrics_df, Metric == "MAPE"),
+       aes(x = Metric, y = Value, fill = Metric)) +
+  geom_bar(stat = "identity", width = 0.5) +
+  labs(title = "Mean Absolute Percentage Error (MAPE)",
+       x = "", y = "MAPE (%)") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+The Random Forest model shows limited predictive power on the test set. While the RMSE (0.0602) and MAE (0.0418) indicate that absolute errors are relatively low, the MAPE of 11.6% suggests moderate percentage-based errors, particularly for small trade PnL values. However, the negative Adjusted $R^2$ (-0.0147) indicates that the model explains less variance than a simple mean predictor.
+
+```{r}
+importance_rf <- varImp(rf_model, scale = TRUE)
+importance_df <- as.data.frame(importance_rf)
+importance_df$Feature <- rownames(importance_df)
+
+top_rf_df <- importance_df %>%
+  arrange(desc(Overall))
+
+ggplot(top_rf_df, aes(x = reorder(Feature, Overall), y = Overall)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Top 10 Feature Importances (Random Forest)",
+    x = "Feature", y = "Importance (Overall)"
+  ) +
+  theme_minimal()
+```
+
+The Random Forest model ranks `fill_prc_diff` and `fill_size` as the most important predictors of `trade_pnl_diff`, suggesting that short-term price movements and trade size are key drivers of profitability. Price-related features (`bid_prc_diff`, `ask_prc_diff`, `mid_price_diff`) also rank highly, reinforcing the influence of microprice dynamics. In contrast, features like `side_S` and `liquidity_Taker` have low importance, indicating that trade direction and liquidity type contribute little to predictive power in this model.
+
+### Deep Learning
+
+Finally, I will use a convolution neural network (CNN) to model `trade_pnl_diff` and evaluate whether it offers improved predictive performance compared to previous models. 
+
+#### Feature Selection
+
+The data has already been scaled, normalized, and one-hot encoded, with both the predictors and target variable transformed to ensure stationary. Since CNNs are highly sensitive to input quality ("garbage in, garbage out"), I will start with `features` and minimize multicollinearity, as the input feature set for the model.
+
+```{r}
+alias(lm(as.formula(paste("trade_pnl_diff ~", paste(features, collapse=" + ")))
+         , data = scaled_data_encoded))$Complete
+```
+
+Like before, the matrix shows that `ask_prc_diff`, `bid_prc_diff`, `deviation_from_mean_mid_price_diff`, and `mid_price_diff` are perfectly colinear. I will keep mid price and remove the other features. Furthermore, `balance` is colinear with `deviation_from_mean_balance`, and `fill_qty` and `fill_prc_diff` is correlated with `fill_size`.
+
+```{r}
+best_vif_features <- setdiff(features, c("ask_prc_diff", "bid_prc_diff", "deviation_from_mean_mid_price_diff", "balance", "fill_qty", "fill_prc_diff"))
+```
+
+```{r}
+vif_formula <- as.formula(paste("trade_pnl_diff ~",
+                                    paste(best_vif_features,
+                                          collapse=" + ")))
+
+vif_model <- lm(vif_formula, data = scaled_data_encoded)
+
+vif(vif_model)
+```
+
+The VIF table shows that all of the features in `best_vif_features` are within acceptable bounds (< 10 VIF).
+
+#### Modelling
+
+First, I want to tune the hyperparameters of the CNN model. To do this, I will need to split my training set into a validation test set for hyperparameter tuning. 
+
+```{r}
+library(torch)
+
+valIndex <- createDataPartition(train_data$trade_pnl_diff, p = 0.25, list = FALSE)
+val_data <- train_data[valIndex, ]
+train_data <- train_data[-valIndex, ]
+
+cat("Train:", nrow(train_data), "| Validation:", nrow(val_data), "| Test:", nrow(test_data), "\n")
+
+train_x <- torch_tensor(as.matrix(train_data[, best_features]), dtype = torch_float32())$unsqueeze(2)
+train_y <- torch_tensor(train_data$trade_pnl_diff, dtype = torch_float32())
+
+val_x   <- torch_tensor(as.matrix(val_data[, best_features]), dtype = torch_float32())$unsqueeze(2)
+val_y   <- torch_tensor(val_data$trade_pnl_diff, dtype = torch_float32())
+
+test_x  <- torch_tensor(as.matrix(test_data[, best_features]), dtype = torch_float32())$unsqueeze(2)
+test_y  <- torch_tensor(test_data$trade_pnl_diff, dtype = torch_float32())
+
+input_features <- length(best_features)
+```
+
+Using these, we can fine-tune the hyperparameters of the CNN models.
+
+```{r}
+cnn_module <- nn_module(
+  initialize = function(filters, kernel_sz, hidden_size, input_size) {
+    self$conv1 <- nn_conv1d(1, filters, kernel_sz)
+    self$relu <- nn_relu()
+    self$flatten <- nn_flatten()
+    
+    conv_out_dim <- filters * (input_size - kernel_sz + 1)
+    self$fc1 <- nn_linear(conv_out_dim, hidden_size)
+    self$fc2 <- nn_linear(hidden_size, 1)
+  },
+  
+  forward = function(x) {
+    x %>% self$conv1() %>% self$relu() %>%
+      self$flatten() %>% self$fc1() %>%
+      self$relu() %>% self$fc2()
+  }
+)
+```
+
+```{r}
+train_cnn <- function(filters, kernel_sz, hidden_size, lr, epochs) {
+  conv_out_dim <- input_features - kernel_sz + 1
+  if (conv_out_dim <= 0) {
+    warning(paste("Skipping invalid combo: kernel_sz =", kernel_sz, 
+                  "is too large for input_features =", input_features))
+    return(list(model = NULL, metrics = list(RMSE = NA, MAE = NA, MAPE = NA), adj_r2 = NA))
+  }
+
+  model <- cnn_module(filters, kernel_sz, hidden_size, input_features)
+  optimizer <- optim_adam(model$parameters, lr = lr)
+  loss_fn <- nn_mse_loss()
+
+  for (epoch in 1:epochs) {
+    model$train()
+    optimizer$zero_grad()
+    preds <- model(train_x)
+    loss_value <- loss_fn(preds, train_y$unsqueeze(2))  # FIXED SHAPE
+    loss_value$backward()
+    optimizer$step()
+  }
+
+  model$eval()
+  with_no_grad({
+    val_preds <- model(val_x)
+  })
+
+  val_preds_array <- as_array(val_preds)
+  val_y_array <- as_array(val_y$unsqueeze(2))  # FIXED SHAPE
+
+  metrics <- evaluate_model(val_y_array, val_preds_array)
+  r2 <- R2(val_preds_array, val_y_array)
+  n <- length(val_y_array)
+  p <- length(best_features)
+  adj_r2 <- 1 - (1 - r2) * ((n - 1) / (n - p - 1))
+
+  list(model = model, metrics = metrics, adj_r2 = adj_r2)
+}
+```
+
+```{r}
+# Filter kernel sizes to ensure they're valid
+kernel_grid <- c(3, 5)
+kernel_grid <- kernel_grid[kernel_grid <= input_features]
+
+filter_grid <- c(16, 32)
+hidden_grid <- c(32, 64)
+lr_grid     <- c(0.001, 0.0005)
+epochs      <- 200
+
+results <- data.frame()
+best_adj_r2 <- -Inf
+
+for (filters in filter_grid) {
+  for (kernel_sz in kernel_grid) {
+    for (hidden_size in hidden_grid) {
+      for (lr in lr_grid) {
+        cat("Training CNN → filters:", filters,
+            "| kernel:", kernel_sz,
+            "| hidden:", hidden_size,
+            "| lr:", lr, "\n")
+
+        res <- train_cnn(filters, kernel_sz, hidden_size, lr, epochs)
+
+        row <- data.frame(filters, kernel_sz, hidden_size, lr,
+                          RMSE = res$metrics$RMSE,
+                          MAE = res$metrics$MAE,
+                          MAPE = res$metrics$MAPE,
+                          Adj_R2 = res$adj_r2)
+
+        results <- rbind(results, row)
+
+        if (!is.na(res$adj_r2) && res$adj_r2 > best_adj_r2) {
+          best_model <- res$model
+          best_adj_r2 <- res$adj_r2
+          best_combo <- row
+        }
+      }
+    }
+  }
+}
+
+cat("\n==== Best Hyperparameters Found ====\n")
+print(best_combo)
+```
+
+#### Evaluation
+
+I will then apply the tuned CNN model on the testing set and evaluate its results.
+
+```{r}
+best_model$eval()
+with_no_grad({
+  test_preds <- best_model(test_x)
+})
+
+test_preds_array <- as_array(test_preds)
+test_y_array     <- as_array(test_y$unsqueeze(2))  # FIXED SHAPE
+
+cnn_eval <- evaluate_model(test_y_array, test_preds_array)
+cnn_r2 <- R2(test_preds_array, test_y_array)
+
+n_cnn <- length(test_y_array)
+p_cnn <- length(best_features)
+cnn_adj_r2 <- 1 - (1 - cnn_r2) * ((n_cnn - 1) / (n_cnn - p_cnn - 1))
+
+cnn_metrics_df <- tibble::tibble(
+  Metric = c("RMSE", "MAE", "MAPE", "Adjusted R-Squared"),
+  Value = c(cnn_eval$RMSE, cnn_eval$MAE, cnn_eval$MAPE, cnn_adj_r2)
+)
+
+print(cnn_metrics_df)
+```
+
+The CNN model achieves relatively low RMSE (`0.0590`) and MAE (`0.0451`), which indicates that on average, the predictions are close to the true `trade_pnl_diff` values in absolute terms. The MAPE, however, remains quite high (`5.71%`), suggesting that even though the errors are small, they can become disproportionately large when actual values are close to zero — a common issue in percentage-based error metrics with small targets. The Adjusted $R^2$ (`0.0130`) is very close to zero, meaning the model explains almost none of the variability in the target variable. Taken together, these results suggest that the CNN is able to make reasonably close predictions but struggles to learn meaningful patterns or variability in the data. 
+
+## Final Evaluation
+
+```{r}
+best_h2o_row <- h2o_results[which.min(h2o_results$RMSE), ]
+
+comparison_df <- data.frame(
+  Metric = c("RMSE", "MAE", "Adjusted R^2", "MAPE"),
+
+  MLR = c(
+    mlr_metrics_df$Value[mlr_metrics_df$Metric == "RMSE"],
+    mlr_metrics_df$Value[mlr_metrics_df$Metric == "MAE"],
+    mlr_metrics_df$Value[mlr_metrics_df$Metric == "Adjusted R-Squared"],
+    mlr_metrics_df$Value[mlr_metrics_df$Metric == "MAPE"]
+  ),
+
+  Best_Subset = c(
+    subset_metrics_df$Value[subset_metrics_df$Metric == "RMSE"],
+    subset_metrics_df$Value[subset_metrics_df$Metric == "MAE"],
+    subset_metrics_df$Value[subset_metrics_df$Metric == "Adjusted R-Squared"],
+    subset_metrics_df$Value[subset_metrics_df$Metric == "MAPE"]
+  ),
+
+  GBM = c(
+    gbm_metrics_df$Value[gbm_metrics_df$Metric == "RMSE"],
+    gbm_metrics_df$Value[gbm_metrics_df$Metric == "MAE"],
+    gbm_metrics_df$Value[gbm_metrics_df$Metric == "Adjusted R-Squared"],
+    gbm_metrics_df$Value[gbm_metrics_df$Metric == "MAPE"]
+  ),
+
+  CNN = c(
+    cnn_metrics_df$Value[cnn_metrics_df$Metric == "RMSE"],
+    cnn_metrics_df$Value[cnn_metrics_df$Metric == "MAE"],
+    cnn_metrics_df$Value[cnn_metrics_df$Metric == "Adjusted R-Squared"],
+    cnn_metrics_df$Value[cnn_metrics_df$Metric == "MAPE"]
+  ),
+
+  H2O = c(
+    best_h2o_row$RMSE,
+    best_h2o_row$MAE,
+    best_h2o_row$Adj_R2,
+    best_h2o_row$MAPE
+  ),
+
+  RF = c(
+    rf_metrics_df$Value[rf_metrics_df$Metric == "RMSE"],
+    rf_metrics_df$Value[rf_metrics_df$Metric == "MAE"],
+    rf_metrics_df$Value[rf_metrics_df$Metric == "Adjusted R-Squared"],
+    rf_metrics_df$Value[rf_metrics_df$Metric == "MAPE"]
+  )
+)
+
+comparison_df
+```
+
+```{r}
+non_mape_df <- comparison_df[comparison_df$Metric != "MAPE", ]
+non_mape_melted <- reshape2::melt(non_mape_df, id.vars = "Metric")
+
+ggplot(non_mape_melted, aes(x = Metric, y = value, fill = variable)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_text(aes(label = round(value, 4)),
+            position = position_dodge(width = 0.9),
+            vjust = -0.3, size = 3) +
+  labs(title = "Model Performance Comparison (excluding MAPE)",
+       x = "Metric", y = "Value") +
+  theme_minimal() +
+  theme(legend.title = element_blank())
+```
+
+When excluding MAPE and focusing solely on Adjusted $R^2$, MAE, and RMSE, the Best Subset model achieves the highest Adjusted $R^2$ at 0.0645, suggesting it explains the most variance in `trade_pnl_diff` despite using fewer, carefully chosen predictors. However, in terms of absolute error metrics, CNN outperforms all other models, achieving the lowest RMSE of 0.0564 and the lowest MAE of 0.0389, suggesting it consistently makes the smallest prediction errors. Surprisingly, Random Forest has the worst Adjusted $R^2$ (negative at -0.0147), meaning it performs worse than a naive mean predictor on this dataset, even though its RMSE and MAE remain competitive. These results suggest that while models like GBM and Best Subset offer slightly better interpretability and variance explanation, deep learning models like CNN excel in minimizing raw prediction error — albeit without much explanatory power.
+
+
+```{r}
+mape_df <- comparison_df[comparison_df$Metric == "MAPE", ]
+mape_melted <- reshape2::melt(mape_df, id.vars = "Metric")
+
+ggplot(mape_melted, aes(x = variable, y = value, fill = variable)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = round(value, 2)), vjust = -0.5, size = 3) +
+  labs(title = "MAPE Comparison Across Models",
+       x = "Model", y = "MAPE (%)") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+In terms of Mean Absolute Percentage Error (MAPE), the CNN model achieved the best performance with the lowest MAPE of 4.58%, followed by GBM at 6.98% and Best Subset Selection at 9.74%, indicating that these models made relatively small percentage errors even on low-magnitude targets. Traditional linear models like MLR and Random Forest performed moderately, with MAPE values of 31.24% and 11.6%, respectively. Notably, H2O AutoML performed worst by a significant margin, producing a MAPE of 189.12%, suggesting overfitting, instability, or poor generalization to small target values. Overall, CNN and GBM stood out as the top performers in minimizing relative error.
+
+```{r}
+# best subset selection
+best_subset_varimp <- varImp(cv_model_subset, scale = TRUE)$importance %>%
+  mutate(Feature = rownames(.)) %>%
+  arrange(desc(Overall))
+
+best_subset_varimp
+
+ggplot(best_subset_varimp, aes(x = reorder(Feature, Overall), y = Overall)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Feature Importance (Best Subset Linear Model)",
+       x = "Feature", y = "Standardized Coefficient Magnitude") +
+  theme_minimal()
+
+# gbm 
+gbm_importance
+
+ggplot(gbm_importance, aes(x = reorder(var, rel.inf), y = rel.inf)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Feature Importance (GBM)",
+       x = "Feature", y = "Relative Influence") +
+  theme_minimal()
+```
+
+To address the research question of identifying which factors influence whether a strategy makes or loses money, I analyzed feature importance from two different models: a Best Subset Linear Model and a Gradient Boosting Machine (GBM). These two were selected because they were the best-performing models in terms of both accuracy and interpretability, providing complementary perspectives, linear and non-linear, on what drives profit and loss at the trade level.
+
+The Best Subset Linear Model ranks `side_S` (whether the trade was a sell) as the most important predictor, followed by `fill_qty` (the quantity traded) and `fee` (transaction cost). This suggests that trade direction, size, and execution cost are key linear drivers of profitability. Meanwhile, the GBM model identifies `fill_prc_diff` (the change in fill price) as the most influential feature, followed by `fill_size` and `fill_qty`, pointing to the importance of short-term price dynamics and execution size in capturing more complex, non-linear effects.
+
+Together, these results indicate that execution-related features, such as trade size, cost, and fill price movement, are consistently important across both modeling frameworks. In particular, while the linear model emphasizes trade mechanics and cost, the GBM adds the insight that short-term price fluctuations also play a significant role in driving trade-level PnL.
+
+## Future Work
+
+This analysis suggests that model performance is limited more by the quality of features than by the complexity of models. Future work should focus on improving data quality and engineering richer, more informative features. Incorporating real-time market signals, macroeconomic indicators, or order book dynamics may reveal hidden drivers of profitability. While advanced models like CNN or AutoML offer potential, our results show that meaningful improvements are more likely to come from better inputs than from further model tuning or architectural complexity.
+
+# Hypothesis Testing for Market Impact
+
+In this section, I investigate whether the trading strategy impacts market efficiency by analyzing how prices behave after a trade. According to the Efficient Market Hypothesis (EMH), prices should fully and instantly reflect all available information, meaning that trading should help prices converge to their true value.
+
+In an efficient market, any new information (including trades) should be incorporated into prices almost immediately, resulting in little to no systematic price change following a transaction. To investigate whether our trading strategy violates this principle, we calculate the one-minute price change after each fill and use permutation testing as a distribution-free method for hypothesis evaluation.
+
+Here, a two-sided permutation test will be most appropriate since prices can change either up or down. The null hypothesis ($H_0$) states that the true mean price change is zero (i.e., trades do not systematically move the price), and the alternative hypothesis ($H_1$) states that the mean price change is nonzero (i.e., trades have a significant upward or downward impact on price). If the permutation test yields a low two-sided p-value, we have evidence against market efficiency in the sense that trades may induce a lasting price impact. Otherwise, if the p-value is large, we cannot reject the idea that post-trade price changes, on average, are indistinguishable from random fluctuations around zero.
+
+To better understand the market impact of trades, we further distinguish between `Maker` and `Taker` trades. A `Maker` trade adds liquidity to the market by placing a limit order that sits on the order book until it is filled, while a `Taker` trade removes liquidity by immediately executing against existing orders, typically using market orders. These roles reflect different trading intentions and can have distinct effects on price movement. Taker trades are more likely to cause immediate price shifts, as they aggressively consume liquidity, while Maker trades may have a more passive influence. By testing these two groups separately, we can identify whether one type of trade contributes more to persistent price changes and thus impacts market efficiency differently.
+
+## Data Preperation
+
+First, we engineer the new feature and compute its value.
+
+```{r}
+market_data <- market_data %>%
+  mutate(mid_price = (ask_prc + bid_prc) / 2)
+
+get_closest_mid_price <- function(time, market_data) {
+  closest_idx <- which.min(abs(market_data$timestamp - time))
+  market_data$mid_price[closest_idx]
+}
+
+fill_data <- fills_data %>%
+  rowwise() %>%
+  mutate(
+    fill_mid_price   = get_closest_mid_price(timestamp, market_data),
+    mid_price_1min   = get_closest_mid_price(timestamp + 60, market_data),
+    price_change     = mid_price_1min - fill_mid_price,
+    price_change_pct = (mid_price_1min / fill_mid_price) - 1
+  ) %>%
+  ungroup() %>%
+  filter(!is.na(price_change))  # remove rows with missing data
+
+maker_data <- fill_data %>% filter(liquidity == "Maker")
+taker_data <- fill_data %>% filter(liquidity == "Taker")
+```
+
+## Permutation Tests
+
+Here, besides running the permutation test, I also want to see the 95% confidence interval of the value. 
+
+```{r}
+# Tests H0: mean(x) = 0 vs. HA: mean(x) != 0 (two-sided).
+permutation_test_one_sample <- function(x, R = 10000) {
+  
+  obs_stat <- mean(x)
+  
+  perm_stats <- numeric(R)
+  for (i in 1:R) {
+    perm_stats[i] <- mean(sample(x))
+  }
+  
+  two_sided_p <- (sum(abs(perm_stats) >= abs(obs_stat)) + 1) / (R + 1)
+  
+  ci <- quantile(perm_stats, c(0.025, 0.975))
+  
+  list(
+    obs_stat       = obs_stat,
+    two_sided_p    = two_sided_p,
+    perm_95CI      = ci
+  )
+}
+```
+
+```{r}
+maker_pricechange_res <- permutation_test_one_sample(maker_data$price_change)
+cat("\n=== Maker price_change ===\n")
+cat("Observed Mean:        ", maker_pricechange_res$obs_stat, "\n")
+cat("Two-sided p-value:    ", maker_pricechange_res$two_sided_p, "\n")
+cat("95% Permutation CI:   ", maker_pricechange_res$perm_95CI, "\n")
+
+# Maker price_change_pct
+maker_pricechangepct_res <- permutation_test_one_sample(maker_data$price_change_pct)
+cat("\n=== Maker price_change_pct ===\n")
+cat("Observed Mean (pct):  ", maker_pricechangepct_res$obs_stat, "\n")
+cat("Two-sided p-value:    ", maker_pricechangepct_res$two_sided_p, "\n")
+cat("95% Permutation CI:   ", maker_pricechangepct_res$perm_95CI, "\n")
+
+# Taker price_change
+taker_pricechange_res <- permutation_test_one_sample(taker_data$price_change)
+cat("\n=== Taker price_change ===\n")
+cat("Observed Mean:        ", taker_pricechange_res$obs_stat, "\n")
+cat("Two-sided p-value:    ", taker_pricechange_res$two_sided_p, "\n")
+cat("95% Permutation CI:   ", taker_pricechange_res$perm_95CI, "\n")
+
+# Taker price_change_pct
+taker_pricechangepct_res <- permutation_test_one_sample(taker_data$price_change_pct)
+cat("\n=== Taker price_change_pct ===\n")
+cat("Observed Mean (pct):  ", taker_pricechangepct_res$obs_stat, "\n")
+cat("Two-sided p-value:    ", taker_pricechangepct_res$two_sided_p, "\n")
+cat("95% Permutation CI:   ", taker_pricechangepct_res$perm_95CI, "\n")
+```
+
+## Results
+
+Overall, the permutation tests suggest no statistically significant deviation from zero in either the Maker or Taker subsets, for both absolute and percentage price changes:
+
+1. Maker Trades
+   - The observed mean (`price_change = 0.525`, `price_change_pct ≈ 0.00028`) is nonzero, but the p-values (~0.998 and ~0.9945) are extremely high.  
+   - The 95% permutation confidence intervals are degenerate at the observed means (both lower and upper bounds are the same number), indicating the permutation distribution did not vary under this particular dataset and code run.  
+   - Interpreted together, this implies there is no evidence that Maker trades systematically shift prices either up or down.
+
+2. Taker Trades**
+   - The observed mean (`price_change = -0.406`, `price_change_pct ≈ -0.00021`) is slightly negative, but again the two-sided p-values (~0.58 and ~0.53) show no significant difference from zero.  
+   - The degenerate 95% CIs mirror the observed means, suggesting the permutation draws yielded no variation for the test statistic.  
+   - Consequently, Taker trades also show no statistically robust post-trade price movement away from zero.
+
+Because the permutation tests fail to reject the null hypothesis in every case (large p-values), the data here do not support the claim that trading—whether Maker or Taker—causes a lasting or systematic price impact. Instead, the results align with the idea that any observed post-trade price changes could be due to random fluctuations rather than a true directional shift in market prices.
+
+In the context of the Efficient Market Hypothesis (EMH), these findings indicate that the market appears to behave efficiently with respect to the trading strategy under investigation. Prices seem to incorporate available information rapidly, and there is no statistical evidence that trades result in predictable or persistent price movements.
+
+# Final Conclusion
+
+Overall, the project demonstrates that while the classification of Buy versus Sell trades achieves near-perfect performance, particularly when incorporating `deviation_from_mean_balance_diff` as a key feature, developing a robust model for Profit and Loss (PnL) prediction remains challenging. The Gradient Boosting Model (GBM) emerges as the strongest among the approaches attempted for forecasting PnL, but further improvements in feature engineering and model tuning are needed, especially for more complex methods such as CNNs and H2O AutoML. Additionally, hypothesis testing based on post-trade price changes suggests that the strategy does not cause a lasting or systematic market impact. Instead, the data are consistent with the Efficient Market Hypothesis (EMH), indicating that prices rapidly absorb the information conveyed by these trades without a predictable, directionally biased shift.
