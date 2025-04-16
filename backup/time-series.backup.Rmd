@@ -1,0 +1,829 @@
+---
+title: "Time Series"
+author: "Alan Matthew"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Modelling Profit and Loss
+
+I now turn to the second research question: identifying the factors that drive the strategy’s profitability. To explore this, I model the strategy’s PnL outcomes and examine the most influential features, aiming to uncover which variables contribute most to profit and loss.
+
+## Feature Engineering
+
+To begin the analysis, I first engineer new features, similar to the ones I engineered before in the previous section.
+```{r}
+regression.data <- merged_data
+# One-hot encode categorical variables (drop first level to avoid collinearity)
+regression.data <- dummy_cols(
+  regression.data,
+  select_columns = c("side", "liquidity"),
+  remove_first_dummy = TRUE,
+  remove_selected_columns = TRUE
+)
+# Convert dummy columns to numeric
+regression.data$liquidity_Taker <- as.numeric(as.character(regression.data$liquidity_Taker))
+regression.data$side_S <- as.numeric(as.character(regression.data$side_S))
+# Add derived variable: fill_size = fill_qty * fill_prc
+regression.data <- regression.data %>%
+  mutate(fill_size = fill_qty * fill_prc)
+# Compute mid_price, volatility, and spread from market data
+volatility_data <- market_data %>%
+  arrange(timestamp) %>%
+  mutate(
+    mid_price = (bid_prc + ask_prc) / 2,
+    volatility = rollapply(mid_price, width = 20, FUN = sd, fill = NA, align = "right"),
+    spread = ask_prc - bid_prc
+  ) %>%
+  select(timestamp, mid_price, volatility, spread)
+# Join with regression data
+setDT(regression.data)
+setDT(volatility_data)
+setkey(regression.data, timestamp)
+setkey(volatility_data, timestamp)
+regression.data <- volatility_data[regression.data, roll = Inf]
+# Inventory features: compute deviation from historical means
+mean_balance <- mean(regression.data$balance, na.rm = TRUE)
+mean_mid_price <- mean(regression.data$mid_price, na.rm = TRUE)
+regression.data <- regression.data %>%
+  mutate(
+    deviation_from_mean_balance = balance - mean_balance,
+    deviation_from_mean_mid_price = mid_price - mean_mid_price
+  )
+```
+```{r, echo=FALSE}
+numerical.variables <- c(
+  "mid_price",
+  "volatility",
+  "fill_prc",
+  "fill_qty",
+  "fee",
+  "balance",
+  "fill_size",
+  "side_S",
+  "liquidity_Taker",
+  "deviation_from_mean_balance",
+  "deviation_from_mean_mid_price",
+  "spread"
+)
+target.variables <- c("cumulative_pnl")
+regression.features <- unique(c(numerical.variables, target.variables))
+```
+
+The engineered features used in this analysis are similar to those developed for modeling trade direction (Buy or Sell). As before, the feature set captures key aspects of market conditions, inventory dynamics, and trade characteristics. However, unlike the classification task, there is no need to lag any variables in this case. This is because the target variable, cumulative profit and loss (PnL), is only observed after each trade is executed. All features are already known at the time the outcome occurs, so lagging would be unnecessary and could limit the information available to the model.
+
+Market conditions are represented by `mid_price`, `volatility`, and `spread`. The `mid_price` is calculated as the average of the best bid and ask prices. `volatility` is measured as the rolling standard deviation of the mid price over the past 20 observations, capturing recent market instability. `spread`, defined as the difference between the best ask and bid prices, serves as an indicator of liquidity tightness at the time of trade.
+
+Trade specific variables include `fill_prc` (execution price), `fill_qty` (quantity traded), `fee` (transaction cost), and `fill_size` (price multiplied by quantity), all of which are known at the moment of execution and reflect the characteristics of each trade.
+
+To account for inventory dynamics, I include the current `balance` and construct `deviation_from_mean_balance`, which measures how far the trader's inventory deviates from its historical average. Similarly, `deviation_from_mean_mid_price` captures whether the trade took place at a relatively high or low price compared to the long run average mid price.
+
+Finally, binary indicators for `side_S` and `liquidity_Taker` identify whether the trade was a Sell or a Buy, and whether it was executed as a Taker or Maker trade. These features together form a consistent and temporally valid representation of the trading environment at the time of each trade, supporting fair and unbiased modeling of PnL.
+
+## Time Series Analysis
+
+Since PnL evolves over time, it is important to treat it as a time series rather than as independent observations. Ignoring this structure can lead to data leakage, biased results, and invalid conclusions.
+
+To ensure reliable modeling, I examine key time series properties such as autocorrelation and stationarity. This helps assess whether standard modeling assumptions hold and whether past values influence future outcomes.
+
+### Stationarity and Autocorrelation
+
+Commonly, many financial time series features such as `mid_price`, `cumulative_pnl`, and `balance` are non-stationary, meaning their statistical properties change over time. In this section, I will check for stationarity and apply appropriate transformations, such as differencing, if necessary. This step is crucial, as non-stationarity can bias statistical models and lead to unreliable or misleading inferences.
+
+```{r, warning=FALSE}
+for (feature in regression.features) {
+  test_result <- adf.test(regression.data[[feature]], alternative = "stationary")
+  cat(sprintf(
+    "\nADF test - %-30s | p-value: %.4f | %s\n",
+    feature,
+    test_result$p.value,
+    ifelse(test_result$p.value < 0.05, "Stationary", "Non-stationary")
+  ))
+}
+```
+
+The variables `mid_price`, `fill_prc`, `deviation_from_mean_mid_price`, and `cumulative_pnl` are non-stationary based on the ADF test (p > 0.05) and will be transformed using first-order differencing to ensure stationarity.
+
+```{r, echo=FALSE, warning=FALSE}
+non_stationary_vars <- c(
+  "mid_price",
+  "fill_prc",
+  "deviation_from_mean_mid_price",
+  "cumulative_pnl"
+)
+for (var in non_stationary_vars) {
+  diff_col <- paste0(var, "_diff")
+  regression.data[[diff_col]] <- c(NA, diff(regression.data[[var]])) # store with _diff postfix
+
+  test_result <- adf.test(na.omit(regression.data[[diff_col]]), alternative = "stationary")
+  cat(sprintf(
+    "\nADF test (1st diff) - %-35s | p-value: %.4f | %s\n",
+    var,
+    test_result$p.value,
+    ifelse(test_result$p.value < 0.05, "Stationary", "Non-stationary")
+  ))
+}
+```
+All four non-stationary variables became stationary after first-order differencing (p < 0.05). The differenced versions will be used in place of the originals. The `regression.features` list will be updated accordingly to include only stationary predictors and target.
+
+```{r, echo=FALSE}
+numerical.variables <- c(
+  "mid_price_diff",
+  "volatility",
+  "fill_prc_diff",
+  "fill_qty",
+  "fee",
+  "balance",
+  "fill_size",
+  "side_S",
+  "liquidity_Taker",
+  "deviation_from_mean_balance",
+  "deviation_from_mean_mid_price_diff",
+  "spread"
+)
+target.variables <- c("cumulative_pnl_diff")
+regression.features <- unique(c(numerical.variables, target.variables))
+```
+
+Next, I will check if my target variable, `cumulative_pnl_diff` needs correction for autocorrelation.
+
+```{r}
+dw_model <- lm(cumulative_pnl_diff ~ 1, data = regression.data)
+dw_test <- dwtest(dw_model)
+cat(
+  "Durbin-Watson Test for Autocorrelation in 1st Diff of Cumulative PnL - p-value:",
+  dw_test$p.value, "\n"
+)
+```
+
+The output shows that `cumulative_pnl` needs to be differenced once more to achieve no autocorrelation.
+
+```{r, echo=FALSE}
+regression.data$cumulative_pnl_diff2 <- c(NA, diff(regression.data$cumulative_pnl_diff))
+```
+```{r}
+regression.data <- na.omit(regression.data)
+dw_model <- lm(cumulative_pnl_diff2 ~ 1, data = regression.data)
+dw_test <- dwtest(dw_model)
+cat(
+  "Durbin-Watson Test for Autocorrelation in 2nd Diff of Cumulative PnL - p-value:",
+  dw_test$p.value, "\n"
+)
+par(mfrow = c(1, 2))
+acf(regression.data$cumulative_pnl_diff2, main = "ACF - Cumulative PnL 2nd Diff")
+pacf(regression.data$cumulative_pnl_diff2, main = "PACF - Cumulative PnL 2nd Diff")
+summary(auto.arima(regression.data$cumulative_pnl_diff2, seasonal = FALSE))
+```
+
+The ARIMA model for `cumulative_pnl_diff2` reveals a significant negative AR(1) coefficient (–0.37), indicating short-term mean-reverting behavior. This is supported by the ACF and PACF plots, where the ACF cuts off after lag 1 and the PACF shows a sharp drop, both consistent with an AR(1) structure. The Durbin-Watson test (p = 1) suggests no remaining autocorrelation. To account for this dynamic, I will include a lag of `cumulative_pnl_diff2` as a feature in the regression model.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+regression.data <- regression.data %>%
+  mutate(cumulative_pnl_diff2_lag1 = lag(cumulative_pnl_diff2)) %>%
+  na.omit()
+numerical.variables <- c(
+  "mid_price_diff",
+  "volatility",
+  "fill_prc_diff",
+  "fill_qty",
+  "fee",
+  "balance",
+  "fill_size",
+  "side_S",
+  "liquidity_Taker",
+  "deviation_from_mean_balance",
+  "deviation_from_mean_mid_price_diff",
+  "spread",
+  "cumulative_pnl_diff2_lag1"
+)
+target.variables <- c("cumulative_pnl_diff2")
+regression.features <- unique(c(numerical.variables, target.variables))
+```
+
+### Trends and Seasons
+
+Having differenced the cumulative PnL twice to achieve a stationary series, I next examine whether any hidden seasonality or cyclical patterns exist in `cumulative_pnl_diff2.` Unlike standard date‐based seasonality (e.g., hourly, daily, or weekly), my timestamps are irregular, so I apply a spectral density analysis (via the Fourier transform) to detect possible periodic behavior at any frequency.
+
+```{r, echo=FALSE}
+spectrum(regression.data$cumulative_pnl_diff2, main = "Spectral Density of Trade PnL")
+```
+
+The spectral plot does not reveal any clear, dominant peaks. In other words, there is no strong evidence of a repeating cycle or seasonality in the second‐differenced PnL series. The spectral density remains slowly varying across frequencies, consistent with white‐noise‐like behavior, further suggesting no obvious seasonal component remains after differencing.
+
+Following this, I will use the Man-Kendall test to verify if there are any trends in the data.
+
+```{r, echo=FALSE}
+mk.test(regression.data$cumulative_pnl_diff2)
+```
+
+The Mann-Kendall trend test returned a z-score of 0.488 and a p-value of 0.6256, indicating no significant monotonic trend in the `cumulative_pnl_diff2` series. The test statistic S and Kendall’s tau are both near zero, further suggesting that there is no upward or downward trend over time. In short, the differenced series does not exhibit a long-term trend, supporting its use in regression without further detrending.
+
+To check whether the target variable is stationary around a deterministic trend (i.e., trend-stationary), I apply the KPSS test:
+
+```{r, echo=FALSE, warning=FALSE}
+kpss.test(regression.data$cumulative_pnl_diff2)
+```
+The KPSS test result indicates that `cumulative_pnl_diff2` is trend-stationary, meaning its fluctuations occur around a stable trend rather than a drifting mean.
+
+### Structural Changes 
+
+Lastly, I will check if there are breakpoints in the target variable `cumulative_pnl_diff2` and if I may need to segregate the time series data. To do this, I will apply a structural break analysis using the Bai-Perron multiple breakpoint test.
+
+```{r, echo=FALSE}
+bp_model <- breakpoints(regression.data$cumulative_pnl_diff2 ~ 1)
+summary(bp_model)
+plot(bp_model, main = "Breakpoints in 2nd Diff of Cumulative PnL")
+```
+
+The Bai-Perron structural break test was applied to assess whether `cumulative_pnl_diff2` exhibits regime shifts over time. The plot shows that the Bayesian Information Criterion (BIC) is minimized at 0 breakpoints, suggesting that adding breakpoints does not improve model fit enough to justify the added complexity. Although residual sum of squares (RSS) decreases with more breakpoints, this comes at the cost of overfitting. Thus, there is no strong evidence of structural breaks, and the time series can be modeled as a single regime without segmentation.
+
+## Data Preparation
+
+Having confirmed that our data meets essential time‐series requirements, I next address outlier removal and dataset partitioning. Since outliers in the target variable can skew model training, I filter them via the Interquartile Range (IQR) method. Finally, I create a 70/30 split of the data into training and testing sets for model evaluation.
+
+### Outliers Removal
+
+```{r, echo=FALSE}
+Q1 <- quantile(regression.data$cumulative_pnl_diff2, 0.25)
+Q3 <- quantile(regression.data$cumulative_pnl_diff2, 0.75)
+IQR_value <- Q3 - Q1
+lower_bound <- Q1 - 1.5 * IQR_value
+upper_bound <- Q3 + 1.5 * IQR_value
+original_count <- nrow(regression.data)
+outliers <- which(
+  regression.data$cumulative_pnl_diff2 < lower_bound |
+    regression.data$cumulative_pnl_diff2 > upper_bound
+)
+num_outliers <- length(outliers)
+cat("Number of outliers removed:", num_outliers, "\n")
+regression.data <- regression.data %>%
+  filter(cumulative_pnl_diff2 >= lower_bound & cumulative_pnl_diff2 <= upper_bound)
+remaining_count <- nrow(regression.data)
+cat("Remaining observations after outlier removal:", remaining_count, "\n")
+```
+
+I apply the interquartile range (IQR) method on `cumulative_pnl_diff2` to determine lower and upper bounds. Observations outside these bounds are deemed outliers and are removed.
+
+### Dataset Partition
+
+I then split the data into a training set and testing set for later use.
+
+```{r, echo=FALSE}
+trainIndex <- createDataPartition(regression.data$cumulative_pnl_diff2, p = 0.7, list = FALSE)
+train_data <- regression.data[trainIndex, ]
+test_data <- regression.data[-trainIndex, ]
+cat("Training Set Size:", nrow(train_data), "rows\n")
+cat("Testing Set Size:", nrow(test_data), "rows\n")
+```
+
+## Feature Selection
+
+After splitting the data into training and testing sets, I will select a parsimonious set of predictors by removing multicollinear features. This involves checking for perfect linear dependencies and filtering variables using Variance Inflation Factors (VIF).
+
+Once multicollinearity is mitigated, I apply three complementary feature selection methods - best subset selection, LASSO regression, and recursive feature elimination (RFE).
+
+### Multicollinearity
+
+```{r, echo=FALSE}
+features <- setdiff(regression.features, "cumulative_pnl_diff2")
+vif_formula <- as.formula(paste("cumulative_pnl_diff2 ~", paste(features, collapse = " + ")))
+vif_model <- lm(vif_formula, data = regression.data)
+alias(vif_model)$Complete
+```
+
+To address perfect multicollinearity, I removed `balance` and `mid_price_diff`, which are perfectly collinear with their respective deviation-based counterparts. I also removed `volatility`, as `deviation_from_mean_mid_price_diff` will serve as our proxy for recent price variability.
+
+```{r, echo=FALSE}
+regression.features <- setdiff(regression.features, c(
+  "mid_price_diff", "balance", "volatility"
+))
+features <- setdiff(features, c("mid_price_diff", "balance", "volatility"))
+vif_formula <- as.formula(paste("cumulative_pnl_diff2 ~", paste(features, collapse = " + ")))
+vif_model <- lm(vif_formula, data = regression.data)
+vif(vif_model)
+```
+
+The VIF table shows that `fill_qty`, `fill_prc_diff`, `fill_size`, and `fee` all exhibit high multicollinearity. To address this, I will remove `fill_qty` and `fill_prc_diff` in favor of `fill_size`, which directly captures trade magnitude in a more interpretable form. I will also remove `fee`, as it is typically a function of trade size.
+
+```{r, echo=FALSE}
+regression.features <- setdiff(regression.features, c("fee", "fill_qty", "fill_prc_diff"))
+features <- setdiff(features, c("fee", "fill_qty", "fill_prc_diff"))
+```
+### Best Subset Selection
+
+After filtering out features with perfect multicollinearity and high variance inflation, the next step is to refine the feature set using model-based selection. I will first apply best subset selection to identify the combination of predictors that offers the best trade-off between model complexity and explanatory power, using adjusted $R^2$ as the selection criterion.
+
+```{r}
+X_best_subset <- as.matrix(regression.data[, ..features])
+y_best_subset <- regression.data$cumulative_pnl_diff2
+best_subset_model <- regsubsets(
+  x = X_best_subset, y = y_best_subset,
+  nvmax = length(features), method = "exhaustive"
+)
+best_subset_summary <- summary(best_subset_model)
+best_subset_size <- which.max(best_subset_summary$adjr2)
+best_subset_features <- names(coef(best_subset_model, best_subset_size))[-1] # exclude intercept
+best_subset_adj_r2 <- best_subset_summary$adjr2[best_subset_size]
+cat("Best subset size (by Adjusted R-Squared):", best_subset_size, "\n")
+cat("Selected features:", best_subset_features, "\n")
+cat("Best subset Adjusted R-Squared:", best_subset_adj_r2, "\n")
+```
+
+The selected features include `fill_size`, `side_S`, `liquidity_Taker`, `deviation_from_mean_balance`, and `cumulative_pnl_diff2_lag1`. The adjusted R squared of 0.1111 indicates limited explanatory power.
+
+### LASSO L1 Regularization
+
+To further refine the feature set for multiple linear regression, I will investigate the set of features selected using LASSO to filter out irrelevant predictors. 
+
+```{r}
+X_lasso <- as.matrix(regression.data[, ..features])
+y_lasso <- regression.data$cumulative_pnl_diff2
+lasso_model <- cv.glmnet(
+  x = X_lasso,
+  y = y_lasso,
+  alpha = 1,
+  family = "gaussian",
+  nfolds = 10
+)
+best_lambda <- lasso_model$lambda.min
+lasso_coef <- coef(lasso_model, s = best_lambda)
+selected_lasso_features <- rownames(lasso_coef)[which(lasso_coef != 0)]
+selected_lasso_features <- setdiff(selected_lasso_features, "(Intercept)")
+cat("LASSO-selected features:\n")
+print(selected_lasso_features)
+```
+
+LASSO selected six features: `fill_size`, `side_S`, `liquidity_Taker`, `deviation_from_mean_balance`, `deviation_from_mean_mid_price_diff`, and `cumulative_pnl_diff2_lag1.` Unlike the best subset selection method, LASSO also considers `deviation_from_mean_mid_price_diff` as important.
+
+### Recursive Feature Elimination (RFE)
+
+Finally, I will also investigate the results from RFE.
+
+```{r}
+X_rfe <- as.data.frame(regression.data[, ..features])
+y_rfe <- regression.data$cumulative_pnl_diff2
+rfe_ctrl <- rfeControl(functions = caretFuncs, method = "cv", number = 10)
+rfe_model <- rfe(
+  x = X_rfe,
+  y = y_rfe,
+  sizes = 1:length(features),
+  rfeControl = rfe_ctrl,
+  method = "lm"
+)
+selected_rfe_features <- predictors(rfe_model)
+cat("RFE-selected features:\n")
+print(selected_rfe_features)
+```
+
+RFE returned a more compact set of three features: `cumulative_pnl_diff2_lag1`, `liquidity_Taker`, and `side_S`, emphasizing recent PnL and execution characteristics.
+
+### Final Feature Selection
+
+For the final feature set, I build on the predictors selected by LASSO and add `spread`. LASSO’s selection includes all features from RFE and best subset (`fill_size`, `side_S`, `liquidity_Taker`, `deviation_from_mean_balance`, `cumulative_pnl_diff2_lag1`) and additionally selects `deviation_from_mean_mid_price_diff`, which captures price variation. I include `spread`, a known driver of PnL, for its role in reflecting market liquidity and trading cost. These seven features form the final set.
+
+```{r, echo=FALSE}
+regression.final.feature.set <- c(
+  "fill_size",
+  "side_S",
+  "liquidity_Taker",
+  "deviation_from_mean_balance",
+  "cumulative_pnl_diff2_lag1",
+  "deviation_from_mean_mid_price_diff",
+  "spread"
+)
+```
+
+## Modelling
+
+Following feature selection, I now turn to modelling to address the core research question: what factors drive profitability? By building and evaluating predictive models, and examining their feature importance, I aim to identify the key drivers of PnL and better understand the variables that most influence trading outcomes.
+
+### Multiple Linear Regression
+
+I begin with multiple linear regression as a baseline model to assess how well the selected features explain variation in PnL. 
+
+#### Model Training
+
+```{r}
+mlr_cv_control <- trainControl(method = "cv", number = 10)
+mlr_cv_model <- train(
+  as.formula(paste(
+    "cumulative_pnl_diff2 ~",
+    paste(regression.final.feature.set, collapse = " + ")
+  )),
+  data = train_data,
+  method = "lm",
+  trControl = mlr_cv_control
+)
+print(mlr_cv_model)
+```
+
+```{r}
+mlr_final_lm <- mlr_cv_model$finalModel
+plot(mlr_final_lm, which = 1) # Residuals vs Fitted
+plot(mlr_final_lm, which = 2) # Q-Q Plot
+dwtest(mlr_final_lm) # Durbin-Watson test for autocorrelation
+```
+
+The residuals vs fitted plot shows a concentration around the center and slight curvature, suggesting possible non-linearity. The Q-Q plot shows deviation in the lower tail, indicating residuals are not perfectly normal. Only the Durbin-Watson test confirms that residuals are not autocorrelated. Thus, not all regression assumptions are fully satisfied.
+
+```{r, echo=FALSE}
+regression.numerical <- setdiff(regression.final.feature.set, c("liquidity_Taker", "side_S"))
+for (var in regression.numerical) {
+  plot(
+    regression.data[[var]],
+    regression.data$cumulative_pnl_diff2,
+    main = paste("cumulative_pnl_diff2 vs", var),
+    xlab = var,
+    ylab = "cumulative_pnl_diff2",
+    pch = 19, col = "steelblue"
+  )
+}
+```
+None of the scatter plots show clear linear patterns, suggesting weak linear relationships between predictors and the target. This may indicate that the linear model cannot fully capture the underlying structure, possibly due to noise or nonlinear dynamics in the target variable.
+
+#### Model Evaluation
+
+```{r}
+mlr_test_predictions <- predict(mlr_cv_model, newdata = test_data)
+mlr_test_actuals <- test_data$cumulative_pnl_diff2
+mlr_test_metrics <- postResample(pred = mlr_test_predictions, obs = mlr_test_actuals)
+n_test <- nrow(test_data)
+p_model <- length(regression.final.feature.set)
+r_squared <- mlr_test_metrics["Rsquared"]
+mlr_adjusted_r_squared <- 1 - ((1 - r_squared) * (n_test - 1)) / (n_test - p_model - 1)
+non_zero_actuals <- mlr_test_actuals != 0
+mlr_mape <- mean(abs((mlr_test_actuals[non_zero_actuals] - mlr_test_predictions[non_zero_actuals]) /
+  mlr_test_actuals[non_zero_actuals])) * 100
+mlr_test_summary <- data.frame(
+  RMSE = mlr_test_metrics["RMSE"],
+  MAE = mlr_test_metrics["MAE"],
+  R_squared = r_squared,
+  Adjusted_R_squared = mlr_adjusted_r_squared,
+  MAPE = mlr_mape
+)
+print(mlr_test_summary)
+```
+
+The model's performance is weak, with an RMSE of 0.0608, MAE of 0.0455, and an adjusted R-squared of only 0.017, indicating that it explains very little of the variance in cumulative PnL. The extremely high MAPE further suggests unstable predictions. Combined with the lack of clear linear relationships between predictors and the target, this suggests that a linear model may be insufficient. Exploring non-linear models may yield better results.
+
+#### Feature Importance
+
+To address the research question on what drives profitability, I examine feature importance from the cross-validated linear model. This helps highlight which predictors contribute most to explaining cumulative PnL.
+
+```{r, echo=FALSE}
+mlr_varimp <- varImp(mlr_cv_model)
+plot(mlr_varimp, main = "Variable Importance - Cross-Validated MLR")
+```
+
+The results show that `cumulative_pnl_diff2_lag1` is the most influential predictor, followed by `liquidity_Taker` and `side_S.` Features like `fill_size`, `deviation_from_mean_balance`, and `spread` have smaller contributions, while `deviation_from_mean_mid_price_diff` shows no meaningful impact. This suggests that recent PnL, execution type, and trade direction are the strongest signals in the linear model.
+
+### Gradient Boosting Machine
+
+To assess whether a non-linear approach can better capture PnL dynamics, I next fit a Gradient Boosting Machine (GBM) regression model.
+
+#### Model Training
+
+A GBM model was trained using the caret package, which performs cross-validated hyperparameter tuning in a single step. The grid searched over tree depth, learning rate, number of trees, and minimum node size using 5-fold cross-validation. Model selection was based on RMSE.
+
+```{r}
+gbm_grid_reg <- expand.grid(
+  n.trees = seq(100, 1000, by = 100),
+  interaction.depth = c(1, 3, 5),
+  shrinkage = c(0.01, 0.05, 0.1),
+  n.minobsinnode = c(5, 10)
+)
+gbm_ctrl_reg <- trainControl(
+  method = "cv",
+  number = 5
+)
+gbm_reg_model <- train(
+  x = train_data[, ..regression.final.feature.set],
+  y = train_data$cumulative_pnl_diff2,
+  method = "gbm",
+  trControl = gbm_ctrl_reg,
+  tuneGrid = gbm_grid_reg,
+  metric = "RMSE",
+  verbose = FALSE
+)
+gbm_reg_model$bestTune
+```
+
+#### Model Evaluation
+
+I evaluate model performance on the test set using RMSE, MAE, $R^2$, adjusted $R^2$, and MAPE to assess prediction quality.
+
+```{r}
+gbm_test_predictions <- predict(gbm_reg_model, newdata = test_data)
+gbm_test_actuals <- test_data$cumulative_pnl_diff2
+gbm_test_metrics <- postResample(pred = gbm_test_predictions, obs = gbm_test_actuals)
+n_test <- nrow(test_data)
+p_model <- length(regression.final.feature.set)
+gbm_r_squared <- gbm_test_metrics["Rsquared"]
+gbm_adjusted_r_squared <- 1 - ((1 - gbm_r_squared) * (n_test - 1)) / (n_test - p_model - 1)
+non_zero_actuals <- gbm_test_actuals != 0
+gbm_mape <- mean(abs((gbm_test_actuals[non_zero_actuals] - gbm_test_predictions[non_zero_actuals]) /
+  gbm_test_actuals[non_zero_actuals])) * 100
+gbm_test_summary <- data.frame(
+  RMSE = gbm_test_metrics["RMSE"],
+  MAE = gbm_test_metrics["MAE"],
+  R_squared = gbm_r_squared,
+  Adjusted_R_squared = gbm_adjusted_r_squared,
+  MAPE = gbm_mape
+)
+print(gbm_test_summary)
+```
+
+The GBM model performs poorly, with low $R^2$ and negative adjusted $R^2$, indicating it explains virtually none of the variance in cumulative PnL. The high MAPE further suggests unstable predictions. Despite its flexibility, GBM does not improve over linear regression.
+
+#### Feature Importance
+
+To interpret how the GBM model makes predictions, I examine the relative influence of each predictor.
+
+```{r, echo=FALSE}
+gbm_varimp_reg <- varImp(gbm_reg_model)
+plot(gbm_varimp_reg, main = "Variable Importance - GBM Regression")
+```
+
+Although the GBM model performed poorly, with low $R^2$, negative adjusted $R^2$, and high MAPE, the feature importance results still provide insight into what the model tried to learn. GBM placed highest importance on `cumulative_pnl_diff2_lag1`, followed by `deviation_from_mean_mid_price_diff` and `fill_size`, suggesting a focus on recent PnL, price positioning, and trade size. In contrast, variables like `liquidity_Taker` and `side_S`, which were more important in the linear model, were less influential. This shift highlights GBM's preference for interaction driven and continuous signals, even though they did not lead to improved performance in this case.
+
+### Deep Learning using Torch
+
+Given that both linear regression and gradient boosting failed to capture meaningful patterns in cumulative PnL, I next explore a deep learning model using `torch.` Neural networks are well suited to modeling complex and non-linear relationships, and may be capable of extracting subtle patterns not captured by traditional models.
+
+#### Model Training
+
+I define a simple feedforward neural network using the `torch` package. The model is trained using mean squared error loss and the Adam optimizer. I standardize the input features to support stable training.
+
+```{r}
+X_train <- as.matrix(scale(train_data[, regression.final.feature.set, with = FALSE]))
+X_test <- as.matrix(scale(test_data[, regression.final.feature.set, with = FALSE]))
+dl_train_actuals <- train_data$cumulative_pnl_diff2
+dl_test_actuals <- test_data$cumulative_pnl_diff2
+# Convert to torch tensors
+X_train_torch <- torch_tensor(X_train, dtype = torch_float())
+X_test_torch <- torch_tensor(X_test, dtype = torch_float())
+y_train_torch <- torch_tensor(as.numeric(dl_train_actuals), dtype = torch_float())$unsqueeze(2)
+# Define neural network model
+dl_model <- nn_module(
+  initialize = function(input_dim) {
+    self$fc1 <- nn_linear(input_dim, 32)
+    self$fc2 <- nn_linear(32, 16)
+    self$output <- nn_linear(16, 1)
+  },
+  forward = function(x) {
+    x %>%
+      self$fc1() %>%
+      nnf_relu() %>%
+      self$fc2() %>%
+      nnf_relu() %>%
+      self$output()
+  }
+)
+# Instantiate model
+model <- dl_model(input_dim = ncol(X_train))
+# Define optimizer and loss
+optimizer <- optim_adam(model$parameters, lr = 0.001)
+criterion <- nn_mse_loss()
+# Training loop
+epochs <- 100
+for (epoch in 1:epochs) {
+  model$train()
+  optimizer$zero_grad()
+  output <- model(X_train_torch)
+  loss <- criterion(output, y_train_torch)
+  loss$backward()
+  optimizer$step()
+  if (epoch %% 10 == 0) {
+    cat("Epoch:", epoch, "Loss:", loss$item(), "\n")
+  }
+}
+```
+
+#### Model Evaluation
+
+I evaluate the model using the same metrics as before: RMSE, MAE, $R^2$, adjusted $R^2$, and MAPE.
+
+```{r}
+dl_test_predictions <- model(X_test_torch) %>%
+  as_array() %>%
+  as.numeric()
+dl_test_actuals <- test_data$cumulative_pnl_diff2
+# Evaluate performance
+dl_test_metrics <- postResample(pred = dl_test_predictions, obs = dl_test_actuals)
+# Compute adjusted R-squared
+n_test <- nrow(test_data)
+p_model <- length(regression.final.feature.set)
+dl_r_squared <- dl_test_metrics["Rsquared"]
+dl_adjusted_r_squared <- 1 - ((1 - dl_r_squared) * (n_test - 1)) / (n_test - p_model - 1)
+# Compute MAPE
+non_zero_actuals <- dl_test_actuals != 0
+dl_mape <- mean(abs((dl_test_actuals[non_zero_actuals] - dl_test_predictions[non_zero_actuals]) /
+  dl_test_actuals[non_zero_actuals])) * 100
+dl_test_summary <- data.frame(
+  RMSE = dl_test_metrics["RMSE"],
+  MAE = dl_test_metrics["MAE"],
+  R_squared = dl_r_squared,
+  Adjusted_R_squared = dl_adjusted_r_squared,
+  MAPE = dl_mape
+)
+print(dl_test_summary)
+```
+
+The deep learning model achieved the lowest RMSE and highest adjusted $R^2$ among all models so far, indicating slightly better fit and generalization. It reduced prediction error compared to MLR and significantly outperformed GBM. Additionally, the deep learning model produced a much lower MAPE than both alternatives, suggesting more stable predictions. While overall predictive power remains modest, deep learning showed the most promise in capturing patterns in PnL.
+
+#### Feature Importance
+
+Neural networks do not naturally expose feature importance. To assess what the model relies on, I apply permutation-based importance, which measures the increase in RMSE when each feature is randomly shuffled.
+
+```{r}
+# Baseline RMSE
+baseline_rmse <- sqrt(mean((dl_test_predictions - dl_test_actuals)^2))
+# Compute permutation importance
+perm_importance <- data.frame(
+  Feature = colnames(X_test),
+  Relative_Importance = NA_real_
+)
+for (i in seq_along(perm_importance$Feature)) {
+  X_perm <- X_test
+  X_perm[, i] <- sample(X_perm[, i])
+  preds <- model(torch_tensor(X_perm, dtype = torch_float())) %>%
+    as_array() %>%
+    as.numeric()
+  perm_rmse <- sqrt(mean((preds - dl_test_actuals)^2))
+  perm_importance$Relative_Importance[i] <- perm_rmse - baseline_rmse
+}
+perm_importance <- perm_importance[order(-perm_importance$Relative_Importance), ]
+print(perm_importance)
+```
+
+The permutation results show that `cumulative_pnl_diff2_lag1` is the most influential features for the deep learning model. This aligns with findings from other models, suggesting that past performance play an important role. Variables like `spread`, `deviation_from_mean_balance`, and `fill_size` had negligible or negative impact when permuted, indicating lower relevance to model predictions.
+
+### H2O AutoML
+
+To continue addressing the research question - what factors drive PnL - I applied H2O AutoML as an automated regression framework. Building on earlier models like multiple linear regression, GBM, and deep learning, AutoML explores a broad range of algorithms and ensembles to uncover non-linear relationships in PnL with minimal manual tuning.
+
+```{r, echo=FALSE, message=FALSE}
+h2o.init(nthreads = -1, max_mem_size = "4G")
+
+train_h2o <- as.h2o(train_data[, c(regression.final.feature.set, "cumulative_pnl_diff2"), with = FALSE])
+test_h2o <- as.h2o(test_data[, c(regression.final.feature.set, "cumulative_pnl_diff2"), with = FALSE])
+
+x <- regression.final.feature.set
+y <- "cumulative_pnl_diff2"
+```
+
+#### Model Training
+
+H2O AutoML was applied to the training data with a limit of 10 models, using RMSE to guide model selection. This provided a quick and efficient way to explore a variety of algorithms and stacking strategies, optimizing prediction accuracy without the need for manual tuning.
+
+```{r}
+automl_reg <- h2o.automl(
+  x = x,
+  y = y,
+  training_frame = train_h2o,
+  max_models = 10,
+  seed = 123,
+  sort_metric = "RMSE"
+)
+lb <- automl_reg@leaderboard
+print(lb)
+```
+The leaderboard shows that the best model selected by H2O AutoML for regression was a stacked ensemble, with the lowest RMSE. However, a GBM (`GBM_grid_1`) performed nearly identically, with only a minimal difference in RMSE and slightly lower MAE. This suggests that both ensemble and GBM models captured similar patterns in the data.
+
+The small performance gap across models indicates that no single approach uncovered a strong signal in PnL, reinforcing earlier findings that the target is inherently difficult to predict, likely due to noise or limited explanatory power in the available features.
+
+#### Model Evaluation
+
+The final model was evaluated on the test set using standard regression metrics: RMSE, MAE, $R^2$, adjusted $R^2$, and MAPE.
+
+```{r}
+automl_test_predictions <- as.vector(h2o.predict(automl_reg@leader, test_h2o))
+automl_test_actuals <- as.vector(test_h2o[[y]])
+automl_test_metrics <- postResample(pred = automl_test_predictions, obs = automl_test_actuals)
+n_test <- nrow(test_data)
+p_model <- length(regression.final.feature.set)
+automl_r_squared <- automl_test_metrics["Rsquared"]
+automl_adjusted_r_squared <- 1 - ((1 - automl_r_squared) * (n_test - 1)) / (n_test - p_model - 1)
+non_zero_actuals <- automl_test_actuals != 0
+automl_mape <- mean(abs((automl_test_actuals[non_zero_actuals] - automl_test_predictions[non_zero_actuals]) /
+  automl_test_actuals[non_zero_actuals])) * 100
+automl_test_summary <- data.frame(
+  RMSE = automl_test_metrics["RMSE"],
+  MAE = automl_test_metrics["MAE"],
+  R_squared = automl_r_squared,
+  Adjusted_R_squared = automl_adjusted_r_squared,
+  MAPE = automl_mape
+)
+print(automl_test_summary)
+```
+
+The H2O AutoML model achieved the best performance overall, with the lowest RMSE and highest adjusted $R^2$ among all models. The top model was a stacked ensemble, closely followed by deep learning. These models outperformed both GBM and multiple linear regression, likely because they are better equipped to capture non-linear relationships and interactions between features. Stacked ensembles combine the strengths of multiple algorithms, reducing the limitations of any single model, while deep learning can model complex patterns that linear methods and tree-based models may overlook. Despite their relative improvement, the modest $R^2$ still suggests that PnL is difficult to predict, likely due to high noise or missing key drivers in the data.
+
+#### Feature Importance
+
+Since the stacked ensemble leader does not provide feature importance, I instead examine individual base models that do. By comparing variable importance across GBM, DRF, XRT, Deep Learning, and GLM, I aim to identify consistently influential predictors of cumulative PnL. This multi-model comparison strengthens our understanding of what truly drives profitability.
+
+```{r, echo=FALSE}
+# GBM
+gbm_id <- automl_reg@leader@model$base_models[grepl("GBM", automl_reg@leader@model$base_models)][1]
+gbm_model <- h2o.getModel(gbm_id)
+h2o.varimp_plot(gbm_model, num_of_features = length(regression.final.feature.set))
+```
+
+```{r, echo=FALSE}
+# DRF
+drf_id <- automl_reg@leader@model$base_models[grepl("DRF", automl_reg@leader@model$base_models)][1]
+drf_model <- h2o.getModel(drf_id)
+h2o.varimp_plot(drf_model, num_of_features = length(regression.final.feature.set))
+```
+
+```{r, echo=FALSE}
+# XRT
+xrt_id <- automl_reg@leader@model$base_models[grepl("XRT", automl_reg@leader@model$base_models)][1]
+xrt_model <- h2o.getModel(xrt_id)
+h2o.varimp_plot(xrt_model, num_of_features = length(regression.final.feature.set))
+```
+
+```{r, echo=FALSE}
+# Deep Learning
+dl_id <- automl_reg@leader@model$base_models[grepl("DeepLearning", automl_reg@leader@model$base_models)][1]
+dl_model <- h2o.getModel(dl_id)
+h2o.varimp_plot(dl_model, num_of_features = length(regression.final.feature.set))
+```
+
+```{r, echo=FALSE}
+# GLM
+glm_id <- automl_reg@leader@model$base_models[grepl("GLM", automl_reg@leader@model$base_models)][1]
+glm_model <- h2o.getModel(glm_id)
+h2o.varimp_plot(glm_model, num_of_features = length(regression.final.feature.set))
+```
+
+Across all models, `cumulative_pnl_diff2_lag1` consistently emerges as the most important feature. The tree-based algorithms (GBM, DRF, XRT) generally rank the next three (`deviation_from_mean_mid_price_diff`, `deviation_from_mean_balance`, `fill_size`) in the upper tier as well, with slight differences in ordering. By contrast, the deep learning model spreads importance more evenly across `liquidity_Taker`, `spread`, and the two deviation metrics (`deviation_from_mean_balance` and `deviation_from_mid_price_diff`). The GLM emphasizes `cumulative_pnl_diff2_lag1`, `liquidity_Taker`, and `side_S` more than the tree models do, reflecting its linear nature and the direct correlations it picks up.
+
+In essence, the tree ensembles show similar patterns because they capture nonlinearities and interactions in comparable ways. The deep learning model, also able to capture complex interactions, balances feature importance more smoothly. The GLM’s simpler structure gives highest weight to features that have a strong linear relationship with the target. 
+
+Since a GBM (`GBM_grid_1`) performed nearly identically to the stacked ensemble, with only a minimal difference in RMSE and slightly lower MAE, I include only the GBM's feature importances to represent H2O AutoML in the final comparison.
+
+### Conclusion
+
+Among all models tested, H2O AutoML achieved the best predictive performance for cumulative PnL, with the lowest RMSE and highest adjusted $R^2$, closely followed by deep learning using torch. These non-linear models outperformed both multiple linear regression and gradient boosting, suggesting that modeling interactions and hidden structure contributes more to predictive accuracy than simple additive relationships.
+
+Multiple linear regression yielded weak results, with an adjusted $R^2$ near zero and high MAPE, indicating it failed to explain variation in PnL. GBM performed even worse, with a negative adjusted $R^2$, making it the weakest model overall.
+
+AutoML's stacked ensemble performed best overall by combining the strengths of a number of base models. Despite this, performance across all models remained modest, reinforcing that PnL is inherently noisy and difficult to predict with available features.
+
+```{r, echo=FALSE}
+model_names <- c("MLR", "GBM", "Deep Learning", "H2O AutoML")
+rmse_values <- c(mlr_test_summary$RMSE, gbm_test_summary$RMSE, dl_test_summary$RMSE, automl_test_summary$RMSE)
+rsq_values <- c(mlr_test_summary$R_squared, gbm_test_summary$R_squared, dl_test_summary$R_squared, automl_test_summary$R_squared)
+adj_rsq_values <- c(mlr_test_summary$Adjusted_R_squared, gbm_test_summary$Adjusted_R_squared, dl_test_summary$Adjusted_R_squared, automl_test_summary$Adjusted_R_squared)
+model_perf <- data.frame(
+  Model = model_names,
+  RMSE = rmse_values,
+  R_squared = rsq_values,
+  Adjusted_R_squared = adj_rsq_values
+)
+model_perf_long <- melt(model_perf, id.vars = "Model")
+ggplot(model_perf_long, aes(x = Model, y = value, fill = variable)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.9)) +
+  geom_text(aes(label = round(value, 3)),
+    position = position_dodge(width = 0.9),
+    vjust = -0.25, size = 3
+  ) +
+  labs(
+    title = "Regression Model Comparison (excluding MAPE)",
+    y = "Metric Value", x = "Model", fill = "Metric"
+  ) +
+  theme_minimal()
+# Separate plot for MAPE
+mape_df <- data.frame(
+  Model = model_names,
+  MAPE = c(mlr_test_summary$MAPE, gbm_test_summary$MAPE, dl_test_summary$MAPE, automl_test_summary$MAPE)
+)
+ggplot(mape_df, aes(x = Model, y = MAPE, fill = Model)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = round(MAPE, 1)), vjust = -0.25, size = 3) +
+  labs(
+    title = "Mean Absolute Percentage Error (MAPE)",
+    y = "MAPE (%)", x = "Model"
+  ) +
+  theme_minimal()
+```
+
+To answer the research question - Can I determine what factors drive profitability? - I draw on the variable importance from the best-performing model in the H2O AutoML framework. While the stacked ensemble achieved the lowest RMSE, a GBM (`GBM_grid_1`) performed nearly identically, with only a minimal difference in RMSE and slightly lower MAE. Therefore, I use the GBM's feature importances to guide interpretation.
+
+The GBM identifies `cumulative_pnl_diff2_lag1` as the most important feature by a significant margin, suggesting that recent profit and loss trends are the strongest available signal for predicting future performance. Other key features include `deviation_from_mean_mid_price_diff`, `deviation_from_mean_balance`, and `fill_size`, pointing to the importance of price positioning, inventory imbalance, and trade size in shaping profitability.
+
+However, it is important to note that the model’s modest $R^2$ indicates that cumulative PnL remains difficult to predict, likely due to noise in the data or missing variables that capture deeper market dynamics. Despite these limitations, the analysis still provides meaningful insight into the relative influence of trade context and temporal patterns on profitability.
+
+#### Future Work
+
+To improve prediction accuracy, future work should focus on creating better features that reflect real time trading behavior. This could include measures such as order book imbalance, how aggressively trades are made, or how much liquidity is available at a given moment. These are likely more informative than basic trade level data.
+
+It may also help to include rolling averages or time based indicators that capture how market conditions change over time, rather than looking at each trade separately.
+
+For modeling, using sequence based approaches like RNNs, LSTMs, or Transformers could be helpful. These models are designed to learn from patterns over time and may reveal decision making behavior that simpler models miss. Combining them with more detailed and dynamic features could lead to better predictions and deeper insight into what drives profit and loss.
